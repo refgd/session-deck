@@ -1,8 +1,10 @@
-FROM node:22-alpine AS builder
+FROM node:22-slim AS builder
 WORKDIR /app
 
 # Install build dependencies for native modules (node-pty, better-sqlite3)
-RUN apk add --no-cache python3 make g++ linux-headers
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
 
 # Install backend dependencies (skip postinstall which tries to cd into frontend)
 COPY package.json package-lock.json ./
@@ -18,17 +20,20 @@ RUN cd frontend && NODE_OPTIONS="--max-old-space-size=1024" npx vite build
 COPY src/ ./src/
 
 # --- Production stage ---
-FROM node:22-alpine
+FROM node:22-slim
 WORKDIR /app
 
 # Runtime dependencies: tmux (local session fallback), openssh-client (remote hosts)
-RUN apk add --no-cache tmux openssh-client
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends tmux openssh-client \
+  && rm -rf /var/lib/apt/lists/*
 
 # Copy built app
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/frontend/dist ./frontend/dist
 COPY --from=builder /app/package.json ./
 COPY src/ ./src/
+COPY public ./public
 
 # Create data directory for SQLite
 RUN mkdir -p /app/data

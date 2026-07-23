@@ -1,0 +1,5 @@
+# Full Access permissions
+default_permissions = ":danger-full-access"
+
+# Do not pause for command approvals
+approval_policy = "never"
