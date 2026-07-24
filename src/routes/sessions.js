@@ -1,12 +1,13 @@
 // src/routes/sessions.js - tmux sessions API
 
-import { listAllSessions, listSessions, createSession, renameSession, deleteSession, captureSession, sendLinesToSession } from '../services/tmux.js';
+import { CAPTURE_TRUNCATION_NOTICE, DEFAULT_CAPTURE_PREVIEW_BYTES, listAllSessions, listSessions, createSession, renameSession, deleteSession, captureSession, sendLinesToSession } from '../services/tmux.js';
 import { isValidSessionName } from '../lib/validate.js';
 import { apiError } from '../lib/api-error.js';
 import { recordAuditEvent } from '../lib/audit-log.js';
 import { attachmentHeader } from '../lib/download-utils.js';
 import { noStoreResponse } from '../lib/response-headers.js';
 import { findHost, getSessionHosts } from '../services/hosts.js';
+import { deleteSessionHistory, getSessionHistoryPage, renameSessionHistory, syncSessionHistory } from '../services/session-history-cache.js';
 
 const INVALID_SESSION_NAME_MESSAGE = 'Invalid session name. Use only letters, digits, hyphens, underscores, and dots.';
 
@@ -112,6 +113,7 @@ export default async function sessionsRoutes(fastify) {
 
     try {
       const result = await renameSession(host, sessionName, newName);
+      renameSessionHistory(db, hostName, sessionName, newName);
       fastify.log.info({ host: hostName, oldName: sessionName, newName }, 'Session renamed');
       recordAuditEvent(db, {
         request,
@@ -146,6 +148,7 @@ export default async function sessionsRoutes(fastify) {
 
     try {
       const result = await deleteSession(host, sessionName);
+      deleteSessionHistory(db, hostName, sessionName);
       fastify.log.info({ host: hostName, session: sessionName }, 'Session deleted');
       recordAuditEvent(db, {
         request,
@@ -238,7 +241,8 @@ export default async function sessionsRoutes(fastify) {
     if (!host) return apiError(reply, `Host not found: ${hostName}`, 404, { host: hostName });
 
     try {
-      const text = await captureSession(host, sessionName);
+      const maxBytes = download ? undefined : (request.query.maxBytes || DEFAULT_CAPTURE_PREVIEW_BYTES);
+      const text = await captureSession(host, sessionName, { maxBytes });
 
       if (download) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -249,7 +253,35 @@ export default async function sessionsRoutes(fastify) {
         return;
       }
 
-      return { host: hostName, session: sessionName, text };
+      return {
+        host: hostName,
+        session: sessionName,
+        text,
+        truncated: text.includes(CAPTURE_TRUNCATION_NOTICE),
+        bytes: Buffer.byteLength(text),
+      };
+    } catch (err) {
+      return apiError(reply, err, err.statusCode, { host: hostName, session: sessionName });
+    }
+  });
+
+  fastify.get('/api/sessions/:hostName/:sessionName/history', async (request, reply) => {
+    noStoreResponse(reply);
+    const { hostName, sessionName } = request.params;
+    if (!isValidSessionName(sessionName)) {
+      return apiError(reply, INVALID_SESSION_NAME_MESSAGE, 400);
+    }
+    const host = findHost(db, hostName);
+    if (!host) return apiError(reply, `Host not found: ${hostName}`, 404, { host: hostName });
+
+    try {
+      if (request.query.sync !== 'false') {
+        await syncSessionHistory(db, host, sessionName);
+      }
+      return getSessionHistoryPage(db, hostName, sessionName, {
+        before: request.query.before,
+        limit: request.query.limit,
+      });
     } catch (err) {
       return apiError(reply, err, err.statusCode, { host: hostName, session: sessionName });
     }

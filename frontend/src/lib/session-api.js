@@ -39,6 +39,20 @@ export async function runSessionRenderTest(host, session, { api = apiOk } = {}) 
   await api(`/api/sessions/${encodeURIComponent(host)}/${encodeURIComponent(session)}/render-test`, { method: 'POST' });
 }
 
+export async function loadSessionCapture(host, session, { maxBytes = 524288, api = apiJson } = {}) {
+  const query = maxBytes ? `?maxBytes=${encodeURIComponent(maxBytes)}` : '';
+  return api(`/api/sessions/${encodeURIComponent(host)}/${encodeURIComponent(session)}/capture${query}`);
+}
+
+export async function loadSessionHistory(host, session, { before = null, limit = 500, sync = true, api = apiJson } = {}) {
+  const params = new URLSearchParams();
+  if (before) params.set('before', String(before));
+  if (limit) params.set('limit', String(limit));
+  if (!sync) params.set('sync', 'false');
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return api(`/api/sessions/${encodeURIComponent(host)}/${encodeURIComponent(session)}/history${query}`);
+}
+
 export function sessionCaptureDownloadPath(host, session) {
   return appPath(`/api/sessions/${encodeURIComponent(host)}/${encodeURIComponent(session)}/capture?download=true`);
 }

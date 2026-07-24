@@ -20,6 +20,7 @@
     onActivePane = () => {},
     onSessionPick = () => {},
     onPaneContextMenu = () => {},
+    onHistory = () => {},
     onReadOnlyToggle = () => {},
     onSplit = () => {},
     onClose = () => {},
@@ -96,6 +97,16 @@
           title={readOnly ? t('switchInputMode') : t('switchReadOnlyMode')}
           onclick={() => onReadOnlyToggle(!readOnly)}
         >{readOnly ? t('readOnly') : t('inputEnabled')}</button>
+        {#if pane.session}
+          <button
+            class="mobile-pane-action history"
+            title={t('viewHistory')}
+            aria-label={t('viewHistory')}
+            onclick={() => onHistory(pane.session, pane.host || DEFAULT_HOST)}
+          >
+            <span class="mobile-history-icon"></span>
+          </button>
+        {/if}
         <button
           class="mobile-pane-action"
           title={t('addPane')}
@@ -138,6 +149,7 @@
             sessionContext={getTypeInfo(pane.session, pane.host || DEFAULT_HOST).context}
             {language}
             onSessionClick={() => onSessionPick(pane.path, pane.session)}
+            onHistory={() => onHistory(pane.session, pane.host || DEFAULT_HOST)}
             onContextMenu={(event) => onPaneContextMenu(event, pane.path, pane.session, pane.host)}
             onCtrlConsumed={() => keyBarRef?.clearCtrl()}
           />
@@ -154,7 +166,6 @@
         <MobileKeyBar
           bind:this={keyBarRef}
           onKey={(seq) => termRef?.sendInput(seq)}
-          onScroll={(lines) => termRef?.scrollHistory(lines)}
           onShowKeyboard={() => termRef?.focusTerminal()}
           onCtrlToggle={(active) => termRef?.setCtrlPending(active)}
           {readOnly}
@@ -287,6 +298,16 @@
   }
   .mobile-close-icon::before { transform: translate(-50%, -50%) rotate(45deg); }
   .mobile-close-icon::after { transform: translate(-50%, -50%) rotate(-45deg); }
+  .mobile-history-icon {
+    display: block; width: 12px; height: 12px; position: relative;
+    border: 1px solid currentColor; border-radius: 2px;
+  }
+  .mobile-history-icon::before,
+  .mobile-history-icon::after {
+    content: ''; position: absolute; left: 2px; right: 2px; height: 1px; background: currentColor;
+  }
+  .mobile-history-icon::before { top: 3px; }
+  .mobile-history-icon::after { top: 7px; }
   .mobile-pane-switcher {
     display: flex; gap: 4px; align-items: center; flex-shrink: 0;
   }

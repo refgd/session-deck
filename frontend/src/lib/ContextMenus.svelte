@@ -16,6 +16,7 @@
     onSplitPane = () => {},
     onZoomPane = () => {},
     onClosePane = () => {},
+    onViewHistory = () => {},
     onExportScrollback = () => {},
     onDeleteSession = () => {},
   } = $props();
@@ -47,6 +48,7 @@
     <button class="ctx-item" onclick={() => onZoomPane(paneMenu)}>{zoomed ? t('restore') : t('zoom')}</button>
     <button class="ctx-item danger" onclick={() => onClosePane(paneMenu)}>{t('closePane')}</button>
     <div class="ctx-sep"></div>
+    <button class="ctx-item" onclick={() => onViewHistory(paneMenu)}>{t('viewHistory')}</button>
     <button class="ctx-item" onclick={() => onExportScrollback(paneMenu)}>{t('exportScrollback')}</button>
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" onclick={() => onDeleteSession(paneMenu)}>{t('killSession')}</button>

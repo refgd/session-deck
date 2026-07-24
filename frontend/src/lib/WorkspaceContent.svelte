@@ -21,6 +21,7 @@
     onUnzoom = () => {},
     onSessionPick = () => {},
     onPaneContextMenu = () => {},
+    onHistory = () => {},
     onReadOnlyMode = () => {},
     onMobilePane = () => {},
     onMobileBack = () => {},
@@ -53,6 +54,7 @@
         sessionContext={getTypeInfo(zoomedPane.session, zoomedPane.host).context}
         {language}
         onZoom={onUnzoom}
+        onHistory={onHistory}
         onSessionClick={() => onSessionPick(zoomedPane.path || [], zoomedPane.session)}
         onContextMenu={(event) => onPaneContextMenu(event, zoomedPane.path || [], zoomedPane.session, zoomedPane.host)}
       />
@@ -73,6 +75,7 @@
       onActivePane={onMobileActivePane}
       onSessionPick={onSessionPick}
       onPaneContextMenu={onPaneContextMenu}
+      onHistory={onHistory}
       onReadOnlyToggle={onReadOnlyMode}
       onSplit={onSplit}
       onClose={onClose}
@@ -91,6 +94,7 @@
         onClose={onClose}
         onDrop={onDrop}
         onPaneContextMenu={onPaneContextMenu}
+        onHistory={onHistory}
         {getTypeInfo}
         {language}
       />

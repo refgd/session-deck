@@ -6,6 +6,7 @@ import {
   createSession,
   deleteSession,
   gitRepoRootCommand,
+  normalizeCaptureMaxBytes,
   renameSession,
   scrollSession,
   sendLinesToSession,
@@ -84,4 +85,12 @@ test('truncateCaptureText preserves UTF-8 character boundaries', () => {
   assert.equal(Buffer.byteLength(truncated) <= 100, true);
   assert.equal(truncated.includes('\uFFFD'), false);
   assert.equal(truncated.endsWith(CAPTURE_TRUNCATION_NOTICE), true);
+});
+
+test('normalizeCaptureMaxBytes bounds history preview payloads', () => {
+  assert.equal(normalizeCaptureMaxBytes(undefined, 1234), 1234);
+  assert.equal(normalizeCaptureMaxBytes('4096'), 4096);
+  assert.equal(normalizeCaptureMaxBytes('bad', 1234), 1234);
+  assert.equal(normalizeCaptureMaxBytes(-1, 1234), 1234);
+  assert.equal(normalizeCaptureMaxBytes(999999999), 2 * 1024 * 1024);
 });

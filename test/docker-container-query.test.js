@@ -58,7 +58,7 @@ test('resolveDockerListGateway resolves enabled managed hosts for Docker listing
   }
 });
 
-test('resolveDockerListGateway rejects missing or disabled gateways', () => {
+test('resolveDockerListGateway allows disabled hosts as Docker discovery gateways', () => {
   const db = createMemoryDb();
   try {
     const disabled = db.prepare(`
@@ -66,12 +66,19 @@ test('resolveDockerListGateway rejects missing or disabled gateways', () => {
       VALUES ('disabled', '10.0.0.20', 'ssh', 0)
     `).run();
 
-    for (const id of [999, disabled.lastInsertRowid]) {
-      assert.throws(
-        () => resolveDockerListGateway(db, { gateway_host_id: String(id) }),
-        err => err.message === 'Gateway host not found' && err.statusCode === 404,
-      );
-    }
+    assert.equal(resolveDockerListGateway(db, { gateway_host_id: String(disabled.lastInsertRowid) }).name, 'disabled');
+  } finally {
+    db.close();
+  }
+});
+
+test('resolveDockerListGateway rejects missing gateways', () => {
+  const db = createMemoryDb();
+  try {
+    assert.throws(
+      () => resolveDockerListGateway(db, { gateway_host_id: '999' }),
+      err => err.message === 'Gateway host not found' && err.statusCode === 404,
+    );
   } finally {
     db.close();
   }

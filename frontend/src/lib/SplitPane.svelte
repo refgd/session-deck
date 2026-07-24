@@ -18,6 +18,7 @@
     onClose = () => {},
     onDrop = () => {},
     onPaneContextMenu = () => {},
+    onHistory = () => {},
     getTypeInfo = () => ({ color: '#6b7688', label: 'TERM', context: null }),
     parentSplit = null,
     siblingCount = 0,
@@ -160,6 +161,7 @@
         onZoom={() => onZoom(nodeId(node), node.session, node.host || DEFAULT_HOST, path)}
         onSplit={(dir) => onSplit(path, dir)}
         onClose={() => onClose(path)}
+        onHistory={onHistory}
         onDragStart={() => {}}
         onContextMenu={(e) => onPaneContextMenu(e, path, node.session, node.host || DEFAULT_HOST)}
       />
@@ -196,6 +198,7 @@
         {onClose}
         {onDrop}
         {onPaneContextMenu}
+        {onHistory}
         {getTypeInfo}
         {language}
         parentSplit={node.split}

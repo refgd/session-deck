@@ -1,5 +1,5 @@
 import { mapManagedHost } from '../services/hosts.js';
-import { getEnabledManagedHostRow } from './managed-host-store.js';
+import { getManagedHostRow } from './managed-host-store.js';
 
 export function parseOptionalGatewayId(value) {
   if (value === undefined || value === null || value === '') return null;
@@ -14,7 +14,7 @@ export function resolveDockerListGateway(db, query = {}) {
   const gatewayId = parseOptionalGatewayId(query.gateway_host_id);
   if (!gatewayId) return null;
 
-  const gateway = getEnabledManagedHostRow(db, gatewayId);
+  const gateway = getManagedHostRow(db, gatewayId);
   if (!gateway) {
     throw Object.assign(new Error('Gateway host not found'), { statusCode: 404 });
   }

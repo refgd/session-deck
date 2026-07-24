@@ -18,6 +18,7 @@
     deleteWorkspaceName = '',
     hostInstallConfirm = null,
     hostInstalling = {},
+    historyViewer = null,
     showSaveTemplate = null,
     saveTemplateName = '',
     onCloseRenameSession = () => {},
@@ -39,6 +40,11 @@
     onDeleteWorkspace = () => {},
     onCloseInstallTmux = () => {},
     onInstallTmux = () => {},
+    onCloseHistory = () => {},
+    onRefreshHistory = () => {},
+    onLoadOlderHistory = () => {},
+    onCopyHistory = () => {},
+    onDownloadHistory = () => {},
     onCloseSaveTemplate = () => {},
     onSaveTemplateName = () => {},
     onSaveTemplate = () => {},
@@ -46,6 +52,12 @@
 
   function t(key, params = {}) {
     return translate(language, key, params);
+  }
+
+  function handleHistoryScroll(event) {
+    if (event.currentTarget.scrollTop <= 24 && historyViewer?.hasMore && !historyViewer.loadingOlder) {
+      onLoadOlderHistory();
+    }
   }
 </script>
 
@@ -180,6 +192,42 @@
   </Modal>
 {/if}
 
+{#if historyViewer}
+  <Modal title={t('historyViewer')} width="min(920px, 94vw)" closeLabel={t('close')} onClose={onCloseHistory}>
+    <div class="modal-body history-body">
+      <div class="history-meta">
+        <span>{historyViewer.host} / {historyViewer.session}</span>
+        {#if historyViewer.cachedLines}
+          <span>{t('cachedLines', { count: historyViewer.cachedLines })}</span>
+        {/if}
+        {#if historyViewer.lastSyncedAt}
+          <span>{t('lastSynced')}: {historyViewer.lastSyncedAt}</span>
+        {/if}
+      </div>
+      {#if historyViewer.loading}
+        <div class="history-state">{t('loadingHistory')}</div>
+      {:else if historyViewer.error}
+        <div class="history-state error">{historyViewer.error}</div>
+      {:else}
+        <div class="history-output" onscroll={handleHistoryScroll}>
+          {#if historyViewer.hasMore}
+            <button class="history-more" onclick={onLoadOlderHistory} disabled={historyViewer.loadingOlder}>
+              {historyViewer.loadingOlder ? t('loadingHistory') : t('loadOlderHistory')}
+            </button>
+          {/if}
+          <pre>{historyViewer.text || t('historyEmpty')}</pre>
+        </div>
+      {/if}
+      <div class="btn-row">
+        <button class="action-btn secondary" onclick={onRefreshHistory} disabled={historyViewer.loading}>{t('refresh')}</button>
+        <button class="action-btn secondary" onclick={onCopyHistory} disabled={!historyViewer.text || historyViewer.loading}>{t('copy')}</button>
+        <button class="action-btn secondary" onclick={onDownloadHistory}>{t('downloadFullHistory')}</button>
+        <button class="action-btn" onclick={onCloseHistory}>{t('close')}</button>
+      </div>
+    </div>
+  </Modal>
+{/if}
+
 {#if showSaveTemplate}
   <Modal title={t('saveAsTemplate')} closeLabel={t('close')} onClose={onCloseSaveTemplate}>
     <div class="modal-body">
@@ -237,4 +285,34 @@
     background: var(--bg-base); padding: 2px 8px; border-radius: 3px;
     border: 1px solid var(--border); color: var(--text-primary);
   }
+  .history-body { gap: 10px; }
+  .history-meta {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    color: var(--text-secondary); font-size: 11px; font-family: 'JetBrains Mono', monospace;
+  }
+  .history-output {
+    height: min(62vh, 620px); overflow: auto; overscroll-behavior: contain;
+    margin: 0; padding: 12px; border: 1px solid var(--border); border-radius: 6px;
+    background: #0b0e11; color: var(--text-primary);
+    -webkit-overflow-scrolling: touch;
+  }
+  .history-output pre {
+    margin: 0;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.45;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .history-more {
+    display: block; margin: 0 auto 10px; padding: 6px 10px; border-radius: 5px;
+    border: 1px solid var(--border); background: var(--bg-raised);
+    color: var(--text-secondary); font-size: 11px; cursor: pointer;
+  }
+  .history-more:disabled {
+    opacity: 0.5; cursor: wait;
+  }
+  .history-state {
+    min-height: 180px; display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); border-radius: 6px; background: #0b0e11;
+    color: var(--text-secondary); font-size: 13px;
+  }
+  .history-state.error { color: var(--danger); }
 </style>

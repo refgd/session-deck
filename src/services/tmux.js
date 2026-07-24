@@ -18,6 +18,7 @@ const PANE_FORMAT = '#{pane_current_command}';
 const PANE_PATH_FORMAT = '#{pane_current_path}';
 export const SESSION_ENRICH_CONCURRENCY = 4;
 export const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_CAPTURE_PREVIEW_BYTES = 512 * 1024;
 export const CAPTURE_TRUNCATION_NOTICE = `\n[Session Deck: capture truncated at ${MAX_CAPTURE_BYTES} bytes]\n`;
 const CAPTURE_EXEC_MAX_BUFFER = MAX_CAPTURE_BYTES + 256 * 1024;
 
@@ -324,15 +325,6 @@ export async function scrollSession(host, sessionName, lines) {
   await execTmux(host, ['send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
 }
 
-/**
- * Capture rendered scrollback for the active pane in a tmux session.
- * This is used to hydrate the browser's local xterm scrollback before attach.
- * @param {object} host
- * @param {string} sessionName
- * @param {object} [options]
- * @param {number} [options.lines=5000]
- * @returns {Promise<string>}
- */
 export async function sendLinesToSession(host, sessionName, lines, options = {}) {
   assertValidSessionName(sessionName);
   const delayMs = Number.isFinite(options.delayMs) ? Math.max(0, options.delayMs) : 50;
@@ -353,10 +345,11 @@ export async function sendLinesToSession(host, sessionName, lines, options = {})
  * @param {string} sessionName
  * @returns {Promise<string>}
  */
-export async function captureSession(host, sessionName) {
+export async function captureSession(host, sessionName, options = {}) {
   assertValidSessionName(sessionName);
 
   const timeout = 10000;
+  const maxBytes = normalizeCaptureMaxBytes(options.maxBytes);
   try {
     // List all window.pane indices in the session
     const paneList = await execTmux(
@@ -384,13 +377,13 @@ export async function captureSession(host, sessionName) {
           maxBuffer: CAPTURE_EXEC_MAX_BUFFER,
         });
         chunks.push(output);
-        if (captureTextByteLength(chunks) > MAX_CAPTURE_BYTES) break;
+        if (captureTextByteLength(chunks) > maxBytes) break;
       } catch (paneErr) {
         chunks.push(`[Error capturing pane: ${paneErr.message}]\n`);
       }
     }
 
-    return truncateCaptureText(chunks.join(''));
+    return truncateCaptureText(chunks.join(''), maxBytes);
   } catch (err) {
     if (err.statusCode) throw err;
     const kind = classifyTmuxError(err);
@@ -409,6 +402,13 @@ export function truncateCaptureText(text, maxBytes = MAX_CAPTURE_BYTES) {
   const noticeBytes = Buffer.byteLength(CAPTURE_TRUNCATION_NOTICE);
   const contentLimit = Math.max(0, maxBytes - noticeBytes);
   return `${utf8Prefix(text, contentLimit)}${CAPTURE_TRUNCATION_NOTICE}`;
+}
+
+export function normalizeCaptureMaxBytes(value, fallback = MAX_CAPTURE_BYTES) {
+  const bytes = Number.parseInt(value, 10);
+  const defaultBytes = Number.isFinite(fallback) && fallback > 0 ? fallback : MAX_CAPTURE_BYTES;
+  if (!Number.isFinite(bytes) || bytes < 1) return defaultBytes;
+  return Math.min(MAX_CAPTURE_BYTES, bytes);
 }
 
 function captureTextByteLength(chunks) {

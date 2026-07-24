@@ -65,6 +65,7 @@
   import {
     createTmuxSession,
     deleteTmuxSession,
+    loadSessionHistory,
     loadHostSessions,
     loadSessionHosts,
     renameTmuxSession,
@@ -185,6 +186,7 @@
   let showDeleteSession = $state(null); // { name, host }
   let sessionMgrLoading = $state(false);
   let hosts = $state([]);
+  let historyViewer = $state(null); // { session, host, text, loading, loadingOlder, error, nextBefore, hasMore }
 
   // Auth user info
   let authUser = $state(null); // { name, email, method } or null
@@ -1399,9 +1401,94 @@
     paneMenu = null;
   }
 
+  function viewHistoryFromMenu(menu) {
+    openHistoryViewer(menu.session, menu.host);
+    paneMenu = null;
+  }
+
   function deleteSessionFromMenu(menu) {
     openDeleteSessionModal(menu.session, menu.host);
     paneMenu = null;
+  }
+
+  async function openHistoryViewer(session, host) {
+    if (!session) return;
+    const target = { session, host: host || DEFAULT_HOST };
+    historyViewer = { ...target, text: '', loading: true, loadingOlder: false, error: null, hasMore: false, nextBefore: null, cachedLines: 0 };
+    await refreshHistoryViewer(target);
+  }
+
+  async function refreshHistoryViewer(target = historyViewer) {
+    if (!target?.session) return;
+    historyViewer = { ...historyViewer, ...target, loading: true, error: null };
+    try {
+      const data = await loadSessionHistory(target.host || DEFAULT_HOST, target.session, { limit: 500, sync: true });
+      historyViewer = {
+        session: target.session,
+        host: target.host || DEFAULT_HOST,
+        text: data.text || '',
+        loading: false,
+        loadingOlder: false,
+        error: null,
+        hasMore: !!data.hasMore,
+        nextBefore: data.nextBefore || null,
+        cachedLines: data.cachedLines || 0,
+        lastSyncedAt: data.lastSyncedAt || null,
+      };
+    } catch (e) {
+      historyViewer = {
+        ...historyViewer,
+        session: target.session,
+        host: target.host || DEFAULT_HOST,
+        loading: false,
+        loadingOlder: false,
+        error: e.message,
+      };
+    }
+  }
+
+  async function loadOlderHistory() {
+    if (!historyViewer?.hasMore || !historyViewer.nextBefore || historyViewer.loading || historyViewer.loadingOlder) return;
+    const current = historyViewer;
+    historyViewer = { ...current, loadingOlder: true, error: null };
+    try {
+      const data = await loadSessionHistory(current.host || DEFAULT_HOST, current.session, {
+        before: current.nextBefore,
+        limit: 500,
+        sync: false,
+      });
+      const olderText = data.text || '';
+      historyViewer = {
+        ...current,
+        text: olderText ? `${olderText}\n${current.text || ''}` : current.text,
+        loadingOlder: false,
+        error: null,
+        hasMore: !!data.hasMore,
+        nextBefore: data.nextBefore || null,
+        cachedLines: data.cachedLines || current.cachedLines || 0,
+      };
+    } catch (e) {
+      historyViewer = { ...current, loadingOlder: false, error: e.message };
+    }
+  }
+
+  function closeHistoryViewer() {
+    historyViewer = null;
+  }
+
+  function downloadHistoryViewer() {
+    if (!historyViewer?.session) return;
+    handleExportScrollback(historyViewer.session, historyViewer.host);
+  }
+
+  async function copyHistoryViewer() {
+    if (!historyViewer?.text) return;
+    try {
+      await navigator.clipboard.writeText(historyViewer.text);
+      toast(t('copied'), 'info');
+    } catch (e) {
+      toast(e.message || t('copyFailed'), 'error');
+    }
   }
 
   async function handleExportScrollback(session, host) {
@@ -1505,6 +1592,7 @@
       onUnzoom={() => zoomedPane = null}
       onSessionPick={openSessionPicker}
       onPaneContextMenu={handlePaneContextMenu}
+      onHistory={openHistoryViewer}
       onReadOnlyMode={setReadOnlyMode}
       onMobilePane={openMinimapPane}
       onMobileBack={backToMinimap}
@@ -1660,6 +1748,7 @@
     onSplitPane={splitPaneFromMenu}
     onZoomPane={zoomPaneFromMenu}
     onClosePane={closePaneFromMenu}
+    onViewHistory={viewHistoryFromMenu}
     onExportScrollback={exportScrollbackFromMenu}
     onDeleteSession={deleteSessionFromMenu}
   />
@@ -1695,6 +1784,7 @@
     deleteWorkspaceName={workspaces.find(w => w.id === showDeleteConfirm)?.name || ''}
     {hostInstallConfirm}
     {hostInstalling}
+    {historyViewer}
     showSaveTemplate={showSaveTemplateModal}
     {saveTemplateName}
     onCloseRenameSession={() => showRenameSession = null}
@@ -1716,6 +1806,11 @@
     onDeleteWorkspace={handleDelete}
     onCloseInstallTmux={() => hostInstallConfirm = null}
     onInstallTmux={installTmuxOnHost}
+    onCloseHistory={closeHistoryViewer}
+    onRefreshHistory={() => refreshHistoryViewer()}
+    onLoadOlderHistory={loadOlderHistory}
+    onCopyHistory={copyHistoryViewer}
+    onDownloadHistory={downloadHistoryViewer}
     onCloseSaveTemplate={() => showSaveTemplateModal = null}
     onSaveTemplateName={(value) => saveTemplateName = value}
     onSaveTemplate={handleSaveTemplate}

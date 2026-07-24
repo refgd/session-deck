@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   createTmuxSession,
   deleteTmuxSession,
+  loadSessionCapture,
+  loadSessionHistory,
   loadHostSessions,
   loadSessionHosts,
   renameTmuxSession,
@@ -79,6 +81,36 @@ test('session API mutation helpers encode host and session names', async () => {
 test('loadSessionHosts returns stable array defaults', async () => {
   assert.deepEqual(await loadSessionHosts({ api: async () => ({ hosts: [{ name: 'box' }] }) }), [{ name: 'box' }]);
   assert.deepEqual(await loadSessionHosts({ api: async () => ({}) }), []);
+});
+
+test('loadSessionCapture encodes host, session, and preview size', async () => {
+  const calls = [];
+  const data = await loadSessionCapture('jump/box', 'main/session', {
+    maxBytes: 12345,
+    api: async (path) => {
+      calls.push(path);
+      return { text: 'history' };
+    },
+  });
+
+  assert.deepEqual(calls, ['/api/sessions/jump%2Fbox/main%2Fsession/capture?maxBytes=12345']);
+  assert.deepEqual(data, { text: 'history' });
+});
+
+test('loadSessionHistory encodes pagination and sync controls', async () => {
+  const calls = [];
+  const data = await loadSessionHistory('jump/box', 'main/session', {
+    before: 42,
+    limit: 250,
+    sync: false,
+    api: async (path) => {
+      calls.push(path);
+      return { text: 'older' };
+    },
+  });
+
+  assert.deepEqual(calls, ['/api/sessions/jump%2Fbox/main%2Fsession/history?before=42&limit=250&sync=false']);
+  assert.deepEqual(data, { text: 'older' });
 });
 
 test('sessionCaptureDownloadPath encodes host and session components', () => {

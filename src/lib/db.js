@@ -146,6 +146,27 @@ function migrate(db) {
       ip TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS session_history_meta (
+      host TEXT NOT NULL,
+      session TEXT NOT NULL,
+      next_line_no INTEGER NOT NULL DEFAULT 1,
+      last_synced_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (host, session)
+    );
+
+    CREATE TABLE IF NOT EXISTS session_history_lines (
+      host TEXT NOT NULL,
+      session TEXT NOT NULL,
+      line_no INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (host, session, line_no)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_session_history_lines_lookup
+      ON session_history_lines (host, session, line_no);
   `);
 
   // Migration: add sort_order if missing (for existing DBs)

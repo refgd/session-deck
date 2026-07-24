@@ -29,7 +29,7 @@ test('attachGateway attaches enabled gateway host details', () => {
   }
 });
 
-test('attachGateway leaves hosts unchanged when gateway is disabled, missing, or self-referential', () => {
+test('attachGateway attaches disabled gateways but leaves missing or self-referential gateways unchanged', () => {
   const db = createMemoryDb();
   try {
     const disabled = db.prepare(`
@@ -53,7 +53,7 @@ test('attachGateway leaves hosts unchanged when gateway is disabled, missing, or
     const disabledGateway = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(target.lastInsertRowid);
     const selfGateway = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(self.lastInsertRowid);
 
-    assert.equal(Object.hasOwn(attachGateway(db, disabledGateway), 'gatewayHost'), false);
+    assert.equal(attachGateway(db, disabledGateway).gatewayHost.name, 'disabled');
     assert.equal(Object.hasOwn(attachGateway(db, missingGateway), 'gatewayHost'), false);
     assert.equal(Object.hasOwn(attachGateway(db, selfGateway), 'gatewayHost'), false);
     assert.equal(attachGateway(db, null), null);

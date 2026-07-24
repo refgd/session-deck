@@ -8,7 +8,7 @@
 
   import { translate } from './i18n.js';
 
-  let { onKey = () => {}, onScroll = () => {}, onShowKeyboard = () => {}, onCtrlToggle = () => {}, readOnly = false, language = 'en' } = $props();
+  let { onKey = () => {}, onShowKeyboard = () => {}, onCtrlToggle = () => {}, readOnly = false, language = 'en' } = $props();
 
   function t(key, params = {}) {
     return translate(language, key, params);
@@ -36,8 +36,6 @@
     { label: '↑', seq: ESC + '[A' },
     { label: '↓', seq: ESC + '[B' },
     { label: '→', seq: ESC + '[C' },
-    { label: 'PgUp', scroll: -24, titleKey: 'pageUp', page: true },
-    { label: 'PgDn', scroll: 24, titleKey: 'pageDown', page: true },
   ];
 
   const NUMBERS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
@@ -87,14 +85,13 @@
   {/if}
   <div class="keybar-row">
     {#each NAV_KEYS as k}
-      {#if !readOnly || k.page}
+      {#if !readOnly}
         <button
           class="key"
           class:wide={k.wide}
           class:accent={k.accent}
-          class:page={k.page}
           title={k.titleKey ? t(k.titleKey) : k.label}
-          onpointerdown={(e) => { e.preventDefault(); k.scroll ? onScroll(k.scroll) : tapKey(k.seq); }}
+          onpointerdown={(e) => { e.preventDefault(); tapKey(k.seq); }}
         >{k.label}</button>
       {/if}
     {/each}
@@ -171,7 +168,6 @@
     font-weight: 700;
   }
   .key.kbd { flex: 0.9; font-size: 18px; }
-  .key.page { font-size: 10px; }
   .key.num { font-size: 16px; }
   .numbers .key { height: 34px; }
 </style>

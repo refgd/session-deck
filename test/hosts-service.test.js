@@ -35,7 +35,7 @@ test('mapManagedHost normalizes managed host rows for connection helpers', () =>
   });
 });
 
-test('getManagedHosts attaches enabled gateway hosts', () => {
+test('getManagedHosts attaches configured gateway hosts', () => {
   const db = createMemoryDb();
   try {
     const gateway = db.prepare(`
@@ -81,7 +81,7 @@ test('attachGateway attaches a gateway to normalized hosts', () => {
   }
 });
 
-test('findHost attaches enabled gateway hosts to matched managed hosts', () => {
+test('findHost attaches configured gateway hosts to matched managed hosts', () => {
   const db = createMemoryDb();
   try {
     const gateway = db.prepare(`
@@ -98,6 +98,28 @@ test('findHost attaches enabled gateway hosts to matched managed hosts', () => {
     assert.equal(app.gatewayHost.name, 'docker-gateway');
     assert.equal(app.gatewayHost.connectionType, 'docker');
     assert.equal(app.gatewayHost.dockerContainer, 'gateway-container');
+  } finally {
+    db.close();
+  }
+});
+
+test('findHost keeps disabled gateways available for session transport', () => {
+  const db = createMemoryDb();
+  try {
+    const gateway = db.prepare(`
+      INSERT INTO managed_hosts (name, hostname, user, connection_type, enabled)
+      VALUES ('jump', 'jump.internal', 'ops', 'ssh', 0)
+    `).run();
+    db.prepare(`
+      INSERT INTO managed_hosts (name, hostname, gateway_host_id, connection_type, docker_container, enabled)
+      VALUES ('container', 'app-container', ?, 'docker', 'app-container', 1)
+    `).run(gateway.lastInsertRowid);
+
+    const host = findHost(db, 'container');
+
+    assert.equal(host.connectionType, 'docker');
+    assert.equal(host.gatewayHost.name, 'jump');
+    assert.equal(host.gatewayHost.enabled, false);
   } finally {
     db.close();
   }

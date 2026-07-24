@@ -14,7 +14,7 @@
 
   const WS_TOKEN_PROTOCOL_PREFIX = 'sessiondeck.ws-token.';
 
-  let { session = 'main', host = DEFAULT_HOST, focused = false, zoomed = false, sessionType = 'terminal', sessionTypeColor = '#6b7688', sessionTypeLabel = 'TERM', sessionContext = null, paneTitle = null, onSessionClick = null, onZoom = null, onSplit = null, onClose = null, onDragStart = null, onContextMenu = null, isMobile = false, readOnly = false, onCtrlConsumed = null, language = 'en' } = $props();
+  let { session = 'main', host = DEFAULT_HOST, focused = false, zoomed = false, sessionType = 'terminal', sessionTypeColor = '#6b7688', sessionTypeLabel = 'TERM', sessionContext = null, paneTitle = null, onSessionClick = null, onZoom = null, onSplit = null, onClose = null, onHistory = null, onDragStart = null, onContextMenu = null, isMobile = false, readOnly = false, onCtrlConsumed = null, language = 'en' } = $props();
 
   function t(key, params = {}) {
     return translate(language, key, params);
@@ -36,8 +36,6 @@
   let suppressTimer;
   let prevSession;
   let prevHost;
-  let pendingScrollLines = 0;
-  let scrollFlushTimer;
   let connected = $state(false);
   let connecting = $state(false);
   let error = $state(null);
@@ -114,10 +112,6 @@
     term?.focus();
   }
 
-  export function scrollHistory(lines) {
-    sendScroll(lines);
-  }
-
   // Arm sticky Ctrl: the next single character typed (from the soft keyboard or
   // the key bar) becomes a control char. Called by the mobile key bar.
   export function setCtrlPending(v) {
@@ -127,8 +121,6 @@
   function disconnect() {
     clearTimeout(resizeTimer);
     clearTimeout(suppressTimer);
-    flushPendingScroll();
-    clearTimeout(scrollFlushTimer);
     if (ws) {
       ws.onclose = null; // Prevent reconnect on intentional close
       ws.close(1000, 'Client disconnect');
@@ -157,33 +149,6 @@
     lastCols = cols;
     lastRows = rows;
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-  }
-
-  function sendScroll(lines) {
-    if (!Number.isFinite(lines) || lines === 0) return;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      pendingScrollLines = clampScrollLines(pendingScrollLines + lines);
-      if (!pendingScrollLines || scrollFlushTimer) return;
-      scrollFlushTimer = setTimeout(flushPendingScroll, 40);
-    }
-  }
-
-  function flushPendingScroll() {
-    clearTimeout(scrollFlushTimer);
-    scrollFlushTimer = null;
-    if (!pendingScrollLines || !ws || ws.readyState !== WebSocket.OPEN) {
-      pendingScrollLines = 0;
-      return;
-    }
-    const lines = pendingScrollLines;
-    pendingScrollLines = 0;
-    ws.send(JSON.stringify({ type: 'scroll', lines }));
-  }
-
-  function clampScrollLines(lines) {
-    if (!Number.isFinite(lines) || lines === 0) return 0;
-    const magnitude = Math.min(200, Math.max(1, Math.floor(Math.abs(lines))));
-    return lines > 0 ? magnitude : -magnitude;
   }
 
   onMount(() => {
@@ -301,41 +266,8 @@
     function installScrollbackHandlers() {
       scrollbackCleanup?.();
 
-      const lineHeight = () => {
-        const rowsEl = containerEl?.querySelector('.xterm-rows');
-        const rowEl = rowsEl?.firstElementChild;
-        const measured = rowEl?.getBoundingClientRect?.().height || 0;
-        return measured || (term.options.fontSize * term.options.lineHeight) || 16;
-      };
-
-      let pendingTouchPixels = 0;
-      let touchScrollFrame = null;
-
-      const scrollByPixels = (deltaY) => {
-        if (!term || !deltaY) return;
-        const lines = Math.trunc(deltaY / lineHeight()) || (deltaY > 0 ? 1 : -1);
-        sendScroll(lines);
-      };
-
-      const scheduleTouchScroll = (deltaY) => {
-        pendingTouchPixels += deltaY;
-        if (touchScrollFrame) return;
-        touchScrollFrame = requestAnimationFrame(() => {
-          touchScrollFrame = null;
-          const pixels = pendingTouchPixels;
-          pendingTouchPixels = 0;
-          scrollByPixels(pixels);
-        });
-      };
-
       const onWheel = (event) => {
         if (Math.abs(event.deltaY) < Math.abs(event.deltaX)) return;
-        const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE
-          ? lineHeight()
-          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-            ? lineHeight() * term.rows
-            : 1;
-        scrollByPixels(event.deltaY * unit);
         event.preventDefault();
         event.stopPropagation();
       };
@@ -365,7 +297,6 @@
         }
         if (event.touches.length !== 1 || lastTouchY === null) return;
         const nextY = event.touches[0].clientY;
-        scheduleTouchScroll(lastTouchY - nextY);
         lastTouchY = nextY;
         event.preventDefault();
         event.stopPropagation();
@@ -381,7 +312,6 @@
       containerEl.addEventListener('touchcancel', onTouchEnd, { capture: true });
 
       scrollbackCleanup = () => {
-        if (touchScrollFrame) cancelAnimationFrame(touchScrollFrame);
         containerEl.removeEventListener('wheel', onWheel, { capture: true });
         containerEl.removeEventListener('touchstart', onTouchStart, { capture: true });
         containerEl.removeEventListener('touchmove', onTouchMove, { capture: true });
@@ -550,6 +480,9 @@
       <button class="pane-act zoom-btn" title={zoomed ? t('restore') : t('zoom')} onclick={(e) => { e.stopPropagation(); onZoom?.(); }}>
         <span class="zoom-icon" class:restore={zoomed}></span>
       </button>
+      <button class="pane-act history-btn" title={t('viewHistory')} onclick={(e) => { e.stopPropagation(); onHistory?.(session, host); }}>
+        <span class="history-icon"></span>
+      </button>
       <button class="pane-act close-act" title={t('closePane')} onclick={(e) => { e.stopPropagation(); onClose?.(); }}>
         <span class="close-icon"></span>
       </button>
@@ -706,6 +639,19 @@
     border-bottom: 1.5px solid currentColor;
     border-left: 1.5px solid currentColor;
   }
+
+  .history-btn { padding: 2px; }
+  .history-icon {
+    display: block; width: 12px; height: 12px; position: relative;
+    border: 1px solid currentColor; border-radius: 1px;
+  }
+  .history-icon::before,
+  .history-icon::after {
+    content: ''; position: absolute; left: 2px; right: 2px;
+    height: 1px; background: currentColor;
+  }
+  .history-icon::before { top: 3px; }
+  .history-icon::after { top: 7px; }
 
   /* Close icon — CSS X */
   .close-icon {

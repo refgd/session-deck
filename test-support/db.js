@@ -91,6 +91,24 @@ export function createMemoryDb() {
       ip TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE session_history_meta (
+      host TEXT NOT NULL,
+      session TEXT NOT NULL,
+      next_line_no INTEGER NOT NULL DEFAULT 1,
+      last_synced_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (host, session)
+    );
+
+    CREATE TABLE session_history_lines (
+      host TEXT NOT NULL,
+      session TEXT NOT NULL,
+      line_no INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (host, session, line_no)
+    );
   `);
   return db;
 }
