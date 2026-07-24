@@ -1,12 +1,15 @@
 // frontend/src/lib/stores/layout.js — Workspace layout tree store
 
+import { DEFAULT_HOST } from '../constants.js';
+import { paneSessionKey } from '../pane-key-utils.js';
+
 /**
  * Layout tree node types:
  *
  * Leaf (terminal pane):
- *   { session: 'main', host: 'reliant', size: 1 }
+ *   { session: 'main', host: DEFAULT_HOST, size: 1 }
  * Empty leaf:
- *   { session: null, host: 'reliant', size: 1 }
+ *   { session: null, host: DEFAULT_HOST, size: 1 }
  *
  * Split (container):
  *   { split: 'h' | 'v', children: [node, node, ...], size: 1 }
@@ -17,7 +20,7 @@
 /**
  * Create a leaf node for a session.
  */
-export function leaf(session = null, host = 'reliant', size = 1) {
+export function leaf(session = null, host = DEFAULT_HOST, size = 1) {
   return { session, host, size };
 }
 
@@ -33,53 +36,6 @@ export function hsplit(children, size = 1) {
  */
 export function vsplit(children, size = 1) {
   return { split: 'v', children, size };
-}
-
-/**
- * Generate preset layouts from a list of session names.
- */
-export function presets(sessionNames) {
-  const s = (i) => leaf(sessionNames[i] || sessionNames[i % sessionNames.length]);
-
-  return {
-    // Simple side-by-side
-    dual: hsplit([s(0), s(1)]),
-
-    // 1 big + 2 stacked
-    'claude-focus': hsplit([
-      { ...s(0), size: 3 },
-      vsplit([s(1), s(2)], 2),
-    ]),
-
-    // 2x2 grid
-    quad: hsplit([
-      vsplit([s(0), s(2)]),
-      vsplit([s(1), s(3)]),
-    ]),
-
-    // 2 wide top + 2 narrow bottom
-    infra: vsplit([
-      hsplit([s(0), s(1)], 3),
-      hsplit([s(2), s(3)], 2),
-    ]),
-
-    // 4x3 grid
-    deck: hsplit([
-      vsplit([s(0), s(4), s(8)]),
-      vsplit([s(1), s(5), s(9)]),
-      vsplit([s(2), s(6), s(10)]),
-      vsplit([s(3), s(7), s(11)]),
-    ]),
-
-    // Complex: big hero + sidebar stack + bottom bar
-    mixed: vsplit([
-      hsplit([
-        { ...s(0), size: 3 },
-        vsplit([s(1), s(2), s(3)], 2),
-      ], 4),
-      hsplit([s(4), s(5)], 1),
-    ]),
-  };
 }
 
 /**
@@ -105,7 +61,7 @@ export function getSessionNames(node) {
  * Returns array of { session, host } objects.
  */
 export function getSessionPanes(node) {
-  if (node.session) return [{ session: node.session, host: node.host || 'reliant' }];
+  if (node.session) return [{ session: node.session, host: node.host || DEFAULT_HOST }];
   if (node.children) return node.children.flatMap(c => getSessionPanes(c));
   return [];
 }
@@ -118,9 +74,26 @@ export function getSessionPanes(node) {
  * Returns array of { session, host, path }.
  */
 export function getSessionPanesWithPaths(node, path = []) {
-  if (!node.children) return [{ session: node.session || null, host: node.host || 'reliant', path }];
+  if (!node.children) return [{ session: node.session || null, host: node.host || DEFAULT_HOST, path }];
   if (node.children) return node.children.flatMap((c, i) => getSessionPanesWithPaths(c, [...path, i]));
   return [];
+}
+
+export function getLeafAtPath(root, path = []) {
+  const node = getNodeAtPath(root, path);
+  return node && !node.children ? node : null;
+}
+
+function getNodeAtPath(root, path = []) {
+  if (!root || !Array.isArray(path)) return null;
+  let node = root;
+  for (const idx of path) {
+    if (!Number.isInteger(idx) || idx < 0 || !node.children || idx >= node.children.length) {
+      return null;
+    }
+    node = node.children[idx];
+  }
+  return node || null;
 }
 
 /**
@@ -166,7 +139,7 @@ function collectLeaves(node) {
   if (!node.children) {
     return [{
       session: node.session || null,
-      host: node.host || 'reliant',
+      host: node.host || DEFAULT_HOST,
       paneTitle: node.paneTitle || undefined,
       size: 1,
     }];
@@ -200,15 +173,14 @@ export function applySessionsToTemplate(node, sessionNames, counter = { i: 0 }) 
  * Returns null if the last pane is removed.
  */
 export function removePane(root, path) {
+  if (!Array.isArray(path)) return root;
   if (path.length === 0) return null; // removing the root itself
 
-  // Navigate to parent
-  let parent = root;
-  for (let i = 0; i < path.length - 1; i++) {
-    parent = parent.children[path[i]];
-  }
+  const parent = getNodeAtPath(root, path.slice(0, -1));
+  if (!parent?.children) return root;
 
   const idx = path[path.length - 1];
+  if (!Number.isInteger(idx) || idx < 0 || idx >= parent.children.length) return root;
   parent.children.splice(idx, 1);
 
   // If parent has only one child left, collapse it
@@ -219,7 +191,7 @@ export function removePane(root, path) {
       delete parent.split;
       delete parent.children;
       parent.session = survivor.session || null;
-      parent.host = survivor.host || 'reliant';
+      parent.host = survivor.host || DEFAULT_HOST;
     } else {
       parent.split = survivor.split;
       parent.children = survivor.children;
@@ -239,26 +211,24 @@ export function removePane(root, path) {
  * direction: 'h' (side-by-side) or 'v' (top-bottom)
  * Returns the modified root.
  */
-export function splitPaneAt(root, path, direction, newSession = 'main', newHost = 'reliant') {
-  // Find the target node
-  let target = root;
-  let parent = null;
-  let parentIdx = -1;
-
-  for (let i = 0; i < path.length; i++) {
-    parent = target;
-    parentIdx = path[i];
-    target = target.children[path[i]];
-  }
-
-  if (!target || target.children) return root; // Can only split leaves
+export function splitPaneAt(root, path, direction, newSession = 'main', newHost = DEFAULT_HOST) {
+  if (!Array.isArray(path)) return root;
+  const target = getLeafAtPath(root, path);
+  if (!target) return root;
+  const parent = path.length > 0 ? getNodeAtPath(root, path.slice(0, -1)) : null;
+  const parentIdx = path[path.length - 1];
 
   const newNode = {
     split: direction,
     size: target.size || 1,
     children: [
-      { session: target.session || null, host: target.host || 'reliant', size: 1 },
-      { session: newSession || null, host: newHost || 'reliant', size: 1 },
+      {
+        session: target.session || null,
+        host: target.host || DEFAULT_HOST,
+        size: 1,
+        ...(target.paneTitle ? { paneTitle: target.paneTitle } : {}),
+      },
+      { session: newSession || null, host: newHost || DEFAULT_HOST, size: 1 },
     ],
   };
 
@@ -274,21 +244,21 @@ export function splitPaneAt(root, path, direction, newSession = 'main', newHost 
 
 /**
  * Move a pane from one location to adjacent to another pane.
- * sourceSession: session name of the pane being dragged
- * targetSession: session name of the drop target
+ * sourcePane: "host:session" pane id, or a session name for compatibility
+ * targetPane: "host:session" pane id, or a session name for compatibility
  * position: 'left' | 'right' | 'top' | 'bottom'
  * Returns new root (deep cloned).
  */
-export function movePane(root, sourceSession, targetSession, position) {
-  if (sourceSession === targetSession) return root;
+export function movePane(root, sourcePane, targetPane, position) {
+  if (sourcePane === targetPane) return root;
 
   // Deep clone
   root = JSON.parse(JSON.stringify(root));
 
   // Handle 'swap' — just swap the session/host data between the two leaves
   if (position === 'swap') {
-    const srcPath = findPathBySession(root, sourceSession);
-    const tgtPath = findPathBySession(root, targetSession);
+    const srcPath = findPathByPane(root, sourcePane);
+    const tgtPath = findPathByPane(root, targetPane);
     if (!srcPath || !tgtPath) return root;
 
     let srcNode = root;
@@ -308,8 +278,8 @@ export function movePane(root, sourceSession, targetSession, position) {
 
   // Check if source and target are siblings in a matching split direction
   // If so, just reorder children instead of creating nested splits
-  const sourcePath = findPathBySession(root, sourceSession);
-  const targetPath = findPathBySession(root, targetSession);
+  const sourcePath = findPathByPane(root, sourcePane);
+  const targetPath = findPathByPane(root, targetPane);
   if (!sourcePath || !targetPath) return root;
 
   const direction = (position === 'left' || position === 'right') ? 'h' : 'v';
@@ -345,7 +315,7 @@ export function movePane(root, sourceSession, targetSession, position) {
   if (!root) return { ...sourceLeaf };
 
   // Re-find target after removal
-  const newTargetPath = findPathBySession(root, targetSession);
+  const newTargetPath = findPathByPane(root, targetPane);
   if (!newTargetPath) return root;
 
   let targetNode = root;
@@ -384,13 +354,18 @@ export function movePane(root, sourceSession, targetSession, position) {
   return root;
 }
 
-function findPathBySession(node, sessionName, path = []) {
-  if (node.session === sessionName) return path;
+function findPathByPane(node, pane, path = []) {
+  if (node.session && paneMatches(node, pane)) return path;
   if (node.children) {
     for (let i = 0; i < node.children.length; i++) {
-      const found = findPathBySession(node.children[i], sessionName, [...path, i]);
+      const found = findPathByPane(node.children[i], pane, [...path, i]);
       if (found) return found;
     }
   }
   return null;
+}
+
+function paneMatches(node, pane) {
+  if (!String(pane).includes(':')) return node.session === pane;
+  return paneSessionKey(node.host, node.session, DEFAULT_HOST) === pane;
 }

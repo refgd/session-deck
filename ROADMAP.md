@@ -7,9 +7,10 @@
 ### Core Features
 - [x] Live terminal panes via xterm.js connected to real tmux sessions
 - [x] Split-tree workspace layouts with drag-to-resize and drag-to-rearrange
-- [x] 6 built-in layout presets (dual, claude-focus, quad, infra, deck, mixed)
+- [x] Empty workspace creation with panes that can attach new or existing sessions
 - [x] Multiple workspaces with keyboard switching (Alt+1-9)
-- [x] Multi-host tmux management via SSH
+- [x] Multi-host tmux management via local, SSH, and Docker targets
+- [x] SSH and Docker access gateways for targets behind another host/container
 - [x] Session management: create, rename, kill sessions from the browser
 - [x] Lazy connect: only active workspace has live WebSocket connections
 - [x] Clean copy/paste from terminal panes
@@ -19,9 +20,12 @@
 
 ### Settings & Configuration
 - [x] Settings menu (click SESSION DECK logo)
-- [x] Host management: add/edit/remove SSH hosts, import from ~/.ssh/config
+- [x] Host management: add/edit/remove SSH and Docker hosts, import from ~/.ssh/config
+- [x] Managed SSH key storage with per-host key selection
+- [x] Docker container discovery, including through configured gateways
 - [x] SSH connectivity testing with tmux detection
 - [x] OS-aware tmux install guidance (10 OS families)
+- [x] User-confirmed tmux installation flow
 - [x] Session management with per-host filtering
 - [x] Cross-navigation between servers and sessions
 
@@ -33,11 +37,9 @@
 - [x] CSS custom properties for full theme customization
 
 ### Authentication & Security
-- [x] Basic auth (username/password from environment config)
-- [x] Microsoft Entra ID (Azure AD) SSO via OpenID Connect with PKCE
-- [x] Generic OIDC provider support (Authentik, Keycloak, etc.)
+- [x] Local account/password authentication
+- [x] First-run administrator setup
 - [x] Session cookies with secure defaults
-- [x] Auth bypass for trusted networks (configurable CIDRs)
 - [x] WebSocket auth enforcement
 - [x] Rate-limited login endpoint (brute-force protection)
 - [x] Security headers (helmet: X-Frame-Options, HSTS, etc.)
@@ -69,7 +71,8 @@
 ### Mobile / Responsive
 - [x] Responsive view for monitoring from phone/tablet
 - [x] Vertical tiling for narrow viewports
-- [ ] Read-only mode for mobile (view output, no input)
+- [x] Mobile keybar with terminal navigation keys
+- [x] Read-only mode for mobile (view output, no input)
 
 ---
 
@@ -116,7 +119,7 @@
 ---
 
 ## Deferred / Evaluating
-- Okta SSO (need test environment)
+- SSO/OIDC providers such as Okta, Entra ID, Authentik, or Keycloak
 - Session sharing via URL (security implications for internet-exposed instances)
 
 ---

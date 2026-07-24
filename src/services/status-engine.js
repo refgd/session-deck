@@ -3,7 +3,7 @@
 // Analyzes terminal PTY output to classify each pane's state:
 //   idle     — sitting at a shell prompt, no recent output
 //   working  — continuous output, process running
-//   asking   — detected a question/prompt pattern (Claude ?, [y/N], etc.)
+//   asking   — detected a question/prompt pattern (Codex/Claude approvals, [y/N], etc.)
 //   done     — process completed (returned to shell prompt after work)
 //   error    — error patterns detected in output
 //   unknown  — just registered, not enough data yet
@@ -38,8 +38,29 @@ const PROMPT_PATTERNS = [
   /\w+@[\w.-]+[:\s~][^$#%]*[$#%]\s*$/m,   // user@host:~ $
   /^\s*\(.*\)\s*[$#%>]\s*$/m,             // (venv) $
   /❯\s*$/m,                                // Starship/custom prompts
+  /^›(?:\s+Message Codex)?\s*$/im,          // Codex prompt
   /➜\s+/m,                                 // Oh My Zsh arrow
   /^\s*>>>\s*$/m,                           // Python REPL
+];
+
+// Codex CLI specific approval/input prompts. These are intentionally phrased
+// around Codex UI labels and approval language so ordinary build/test output
+// does not get classified as asking.
+const CODEX_ASKING_PATTERNS = [
+  /\b(?:approval|permission) required\b/i,
+  /\bwaiting for (?:your )?(?:approval|permission|confirmation)\b/i,
+  /\brequires (?:your )?(?:approval|permission|confirmation)\b/i,
+  /\bapprove (?:command|this command|this action|changes|edit|patch)\b/i,
+  /\b(?:allow|deny)\b.*\b(?:command|action|edit|patch|network|access|tool)\b/i,
+  /\b(?:accept|reject)\b.*\b(?:changes|patch|diff)\b/i,
+  /\bdo you want codex to\b/i,
+  /\bcodex (?:needs|requires|is waiting for) (?:your )?(?:approval|permission|input|response)\b/i,
+];
+
+const CODEX_WORKING_PATTERNS = [
+  /\bCodex\b.*\b(?:thinking|working|running|editing|applying|searching|reading|testing|building|checking|reviewing|analyzing|planning)\b/i,
+  /\b(?:thinking|working|running command|editing files?|applying patch|searching|reading files?|testing|building|checking|reviewing|analyzing|planning)\b/i,
+  /^\s*(?:•|-)\s*(?:Running|Reading|Editing|Applying|Searching|Testing|Building|Checking|Reviewing|Analyzing|Planning)\b/im,
 ];
 
 // Question/asking patterns — something is waiting for user input
@@ -60,6 +81,7 @@ const ASKING_PATTERNS = [
   /Would you like/i,
   /Shall I/i,
   /waiting for (?:your|user) (?:input|response)/i,
+  ...CODEX_ASKING_PATTERNS,
   // Claude Code input prompt (❯ character at start of line)
   /^❯\s*$/m,
   // GSD/pi input prompt
@@ -106,14 +128,15 @@ const IDLE_TIMEOUT = 3000;
 // Rolling buffer size per PTY (bytes of stripped text to keep for analysis)
 const BUFFER_SIZE = 4096;
 
-class StatusEngine {
-  constructor() {
+export class StatusEngine {
+  constructor(options = {}) {
     /** @type {Map<string, PaneState>} */
     this._panes = new Map();
     /** @type {Set<function>} */
     this._listeners = new Set();
     /** @type {Map<string, NodeJS.Timeout>} */
     this._idleTimers = new Map();
+    this._maxPanes = options.maxPanes ?? 1000;
   }
 
   /**
@@ -123,10 +146,12 @@ class StatusEngine {
    * @param {string} session
    */
   register(id, host, session) {
+    this.remove(id);
     this._panes.set(id, {
       id,
       host,
       session,
+      registeredAt: Date.now(),
       status: 'unknown',
       prevStatus: null,
       lastTransition: Date.now(),
@@ -135,6 +160,7 @@ class StatusEngine {
       buffer: '',
       lastError: null,
     });
+    this._pruneOldestPanes();
   }
 
   /**
@@ -279,6 +305,11 @@ class StatusEngine {
           return 'idle';
         }
       }
+      for (const pat of CODEX_WORKING_PATTERNS) {
+        if (pat.test(chunk) || pat.test(recent)) {
+          return 'working';
+        }
+      }
       return 'working';
     }
 
@@ -360,6 +391,15 @@ class StatusEngine {
         this._transition(pane, 'idle');
       }
     }, IDLE_TIMEOUT));
+  }
+
+  _pruneOldestPanes() {
+    if (!Number.isFinite(this._maxPanes) || this._maxPanes < 1) return;
+    while (this._panes.size > this._maxPanes) {
+      const oldest = this._panes.keys().next().value;
+      if (!oldest) return;
+      this.remove(oldest);
+    }
   }
 }
 

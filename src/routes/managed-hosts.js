@@ -1,468 +1,453 @@
 // src/routes/managed-hosts.js — CRUD API for managed SSH hosts
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { parseSSHConfig } from '../services/ssh-config.js';
-import { execDockerOnHost, listRunningContainers } from '../services/docker.js';
+import { dockerListContext, listRunningContainersWithContext } from '../services/docker.js';
 import { deleteSshKey, listSshKeys, saveSshKey } from '../services/ssh-keys.js';
-import { mapManagedHost } from '../services/hosts.js';
-import { sshBaseArgs, sshTarget } from '../services/connection.js';
+import { installTmux, testHost } from '../services/managed-host-diagnostics.js';
+import { attachGateway } from '../services/hosts.js';
+import { apiError } from '../lib/api-error.js';
+import { recordAuditEvent } from '../lib/audit-log.js';
+import { mapWithConcurrency } from '../lib/async-utils.js';
+import { noStoreResponse } from '../lib/response-headers.js';
+import {
+  countManagedHosts,
+  deleteManagedHost,
+  gatewayExists,
+  getManagedHostRow,
+  groupManagedHostRows,
+  hostNameExists,
+  importSshConfigHosts,
+  insertManagedHost,
+  listEnabledManagedHostRows,
+  listHostsUsingIdentityFile,
+  listIdentityFileUsageRows,
+  listManagedHostRows,
+  updateManagedHost,
+  updateManagedHostTestResult,
+  wouldCreateGatewayCycle,
+} from '../lib/managed-host-store.js';
+import { normalizeHostPayload } from '../lib/host-payload.js';
+import { resolveDockerListGateway } from '../lib/docker-container-query.js';
+import { parsePositiveRouteId } from '../lib/route-params.js';
+import { redactPath } from '../lib/path-redaction.js';
 
-const execFileAsync = promisify(execFile);
+export const MANAGED_HOST_TEST_CONCURRENCY = 4;
+export const DOCKER_CONTAINER_RATE_LIMIT_MAX = 30;
+export const DOCKER_CONTAINER_RATE_LIMIT_WINDOW = '1 minute';
+export const HOST_TEST_RATE_LIMIT_MAX = 60;
+export const HOST_TEST_RATE_LIMIT_WINDOW = '1 minute';
+export const HOST_INSTALL_RATE_LIMIT_MAX = 10;
+export const HOST_INSTALL_RATE_LIMIT_WINDOW = '10 minutes';
+export const HOST_TEST_ALL_RATE_LIMIT_MAX = 10;
+export const HOST_TEST_ALL_RATE_LIMIT_WINDOW = '1 minute';
 
-function normalizeHost(host) {
-  if (!host) return host;
-  if (host.connectionType) return host;
-  const normalized = mapManagedHost(host);
-  if (host.gatewayHost) normalized.gatewayHost = host.gatewayHost;
-  if (host.gateway_host_id && !normalized.gatewayHost) normalized.gatewayHostId = host.gateway_host_id;
-  return normalized;
+function listKeysWithUsage(db) {
+  const hosts = listIdentityFileUsageRows(db);
+  return listSshKeys().map(key => sshKeyResponse(key, hosts));
 }
 
-function attachGateway(db, host) {
-  if (!host?.gateway_host_id) return host;
-  const gateway = db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1 AND id = ?').get(host.gateway_host_id);
-  if (!gateway || gateway.id === host.id) return host;
-  return { ...host, gatewayHost: mapManagedHost(gateway) };
-}
-
-/**
- * Test SSH connectivity and tmux availability for a host.
- */
-async function testHost(host) {
-  const startMs = Date.now();
-  const result = {
-    status: 'error',
-    tmuxAvailable: false,
-    os: null,
-    osId: null,
-    tmuxVersion: null,
-    installCommand: null,
-    error: null,
-    durationMs: 0,
+export function sshKeyResponse(key, hosts = []) {
+  return {
+    ...key,
+    displayPath: redactPath(key.path),
+    usedByHosts: hosts
+      .filter(host => host.identity_file === key.path)
+      .map(host => ({ id: host.id, name: host.name })),
   };
-
-  try {
-    const connectionType = host.connection_type || (host.auth_method === 'docker' ? 'docker' : 'ssh');
-
-    if (connectionType === 'docker') {
-      await execDockerOnHost(normalizeHost(host), ['true'], 5000);
-      result.status = 'ok';
-
-      try {
-        const stdout = await execDockerOnHost(normalizeHost(host), ['tmux', '-V'], 5000);
-        result.tmuxAvailable = true;
-        result.tmuxVersion = stdout.trim();
-      } catch {
-        result.tmuxAvailable = false;
-        try {
-          const stdout = await execDockerOnHost(normalizeHost(host), ['cat', '/etc/os-release'], 5000);
-          const idMatch = stdout.match(/^ID=(.+)$/m);
-          const nameMatch = stdout.match(/^PRETTY_NAME="?(.+?)"?$/m);
-          result.osId = idMatch?.[1]?.replace(/"/g, '') || null;
-          result.os = nameMatch?.[1] || result.osId;
-        } catch {
-          result.os = 'Container';
-        }
-      }
-    } else if (host.is_local) {
-      // Local host — direct exec
-      try {
-        const { stdout } = await execFileAsync('tmux', ['-V'], { timeout: 5000 });
-        result.tmuxAvailable = true;
-        result.tmuxVersion = stdout.trim();
-      } catch {
-        result.tmuxAvailable = false;
-      }
-
-      // Get OS info
-      try {
-        const { stdout } = await execFileAsync('cat', ['/etc/os-release'], { timeout: 3000 });
-        const idMatch = stdout.match(/^ID=(.+)$/m);
-        const nameMatch = stdout.match(/^PRETTY_NAME="?(.+?)"?$/m);
-        result.osId = idMatch?.[1]?.replace(/"/g, '') || null;
-        result.os = nameMatch?.[1] || result.osId;
-      } catch {
-        result.os = 'Linux';
-      }
-
-      result.status = 'ok';
-    } else {
-      // Remote host — SSH
-      const sshArgs = buildSSHArgs(host);
-
-      // Step 1: connectivity test
-      await execFileAsync('ssh', [...sshArgs, 'echo', 'ok'], { timeout: 8000 });
-      result.status = 'ok';
-
-      // Step 2: tmux check
-      try {
-        const { stdout } = await execFileAsync('ssh', [...sshArgs, 'tmux', '-V'], { timeout: 5000 });
-        result.tmuxAvailable = true;
-        result.tmuxVersion = stdout.trim();
-      } catch (err) {
-        result.tmuxAvailable = false;
-        // tmux not found — get OS info for install guidance
-        try {
-          const { stdout } = await execFileAsync('ssh', [...sshArgs, 'cat', '/etc/os-release'], { timeout: 5000 });
-          const idMatch = stdout.match(/^ID=(.+)$/m);
-          const nameMatch = stdout.match(/^PRETTY_NAME="?(.+?)"?$/m);
-          result.osId = idMatch?.[1]?.replace(/"/g, '') || null;
-          result.os = nameMatch?.[1] || result.osId;
-        } catch {
-          // Try uname as fallback
-          try {
-            const { stdout } = await execFileAsync('ssh', [...sshArgs, 'uname', '-s'], { timeout: 5000 });
-            result.os = stdout.trim();
-          } catch {
-            result.os = 'Unknown';
-          }
-        }
-      }
-    }
-
-    // Generate install command based on OS
-    if (!result.tmuxAvailable && result.osId) {
-      result.installCommand = getInstallCommand(result.osId);
-    }
-  } catch (err) {
-    result.status = 'error';
-    const msg = err.stderr || err.message || 'Connection failed';
-    // Trim verbose SSH errors to just the key part
-    if (msg.includes('Connection timed out')) result.error = 'Connection timed out';
-    else if (msg.includes('Connection refused')) result.error = 'Connection refused';
-    else if (msg.includes('No route to host')) result.error = 'No route to host';
-    else if (msg.includes('Permission denied')) result.error = 'Permission denied (auth failed)';
-    else if (msg.includes('Host key verification')) result.error = 'Host key verification failed';
-    else result.error = msg.split('\n')[0].slice(0, 120);
-  }
-
-  result.durationMs = Date.now() - startMs;
-  return result;
-}
-
-async function installTmux(host) {
-  const test = await testHost(host);
-  if (test.status !== 'ok') {
-    throw Object.assign(new Error(test.error || 'Host is not reachable'), { statusCode: 503 });
-  }
-  if (test.tmuxAvailable) {
-    return { installed: false, alreadyInstalled: true, test };
-  }
-
-  if (!test.osId) {
-    throw Object.assign(new Error('Could not detect OS for tmux installation'), { statusCode: 400 });
-  }
-
-  const connectionType = host.connection_type || (host.auth_method === 'docker' ? 'docker' : 'ssh');
-  const useSudo = connectionType !== 'docker';
-  const installCommand = getInstallCommand(test.osId, { sudo: useSudo });
-
-  if (!installCommand || installCommand.startsWith('#')) {
-    throw Object.assign(new Error(`Unsupported OS for automatic install: ${test.osId}`), { statusCode: 400 });
-  }
-
-  if (connectionType === 'docker') {
-    await execDockerOnHost(normalizeHost(host), ['sh', '-lc', installCommand], 120000);
-  } else if (host.is_local) {
-    await execFileAsync('sh', ['-lc', installCommand], { timeout: 120000 });
-  } else {
-    const sshArgs = buildSSHArgs(host);
-    await execFileAsync('ssh', [...sshArgs, installCommand], { timeout: 120000 });
-  }
-
-  const after = await testHost(host);
-  return { installed: after.tmuxAvailable, alreadyInstalled: false, installCommand, test: after };
-}
-
-/**
- * Build SSH command arguments for a host.
- */
-function buildSSHArgs(host) {
-  return [...sshBaseArgs(normalizeHost(host), { timeoutMs: 5000 }), sshTarget(host)];
-}
-
-/**
- * Get tmux install command for a given OS ID.
- */
-function getInstallCommand(osId, options = {}) {
-  const sudo = options.sudo === false ? '' : 'sudo ';
-  const commands = {
-    ubuntu: `${sudo}apt-get update && ${sudo}DEBIAN_FRONTEND=noninteractive apt-get install -y tmux`,
-    debian: `${sudo}apt-get update && ${sudo}DEBIAN_FRONTEND=noninteractive apt-get install -y tmux`,
-    fedora: `${sudo}dnf install -y tmux`,
-    centos: `${sudo}yum install -y tmux`,
-    rhel: `${sudo}yum install -y tmux`,
-    arch: `${sudo}pacman -Sy --noconfirm tmux`,
-    alpine: `${sudo}apk add --no-cache tmux`,
-    opensuse: `${sudo}zypper install -y tmux`,
-    freebsd: `${sudo}pkg install -y tmux`,
-    darwin: 'brew install tmux',
-  };
-  return commands[osId] || `# Install tmux for ${osId}`;
 }
 
 export default async function managedHostsRoutes(fastify) {
   const db = fastify.db;
 
-  fastify.get('/api/docker/containers', async (request, reply) => {
+  fastify.get('/api/docker/containers', {
+    config: {
+      rateLimit: {
+        max: DOCKER_CONTAINER_RATE_LIMIT_MAX,
+        timeWindow: DOCKER_CONTAINER_RATE_LIMIT_WINDOW,
+      },
+    },
+  }, async (request, reply) => {
+    noStoreResponse(reply);
+    let context = null;
     try {
-      const gatewayId = request.query.gateway_host_id ? Number(request.query.gateway_host_id) : null;
-      const gateway = gatewayId
-        ? db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1 AND id = ?').get(gatewayId)
-        : null;
-      if (gatewayId && !gateway) return reply.code(404).send({ error: 'Gateway host not found' });
-      return { containers: await listRunningContainers(gateway ? mapManagedHost(gateway) : null) };
+      const gateway = resolveDockerListGateway(db, request.query);
+      context = dockerListContext(gateway);
+      return await listRunningContainersWithContext(gateway);
     } catch (err) {
-      return reply.code(503).send({ error: err.message || 'Failed to list Docker containers' });
+      return apiError(reply, err, err.statusCode || 503, {
+        ...(context ? { context } : {}),
+      });
     }
   });
 
-  fastify.get('/api/ssh-keys', async () => {
-    return { keys: listSshKeys() };
+  fastify.get('/api/ssh-keys', async (_request, reply) => {
+    noStoreResponse(reply);
+    try {
+      return { keys: listKeysWithUsage(db) };
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500);
+    }
   });
 
   fastify.post('/api/ssh-keys', async (request, reply) => {
     try {
       const key = saveSshKey(request.body || {});
+      recordAuditEvent(db, {
+        request,
+        action: 'ssh_key.create',
+        targetType: 'ssh_key',
+        targetName: key.name,
+        details: { path: key.path },
+      });
       reply.code(201);
       return key;
     } catch (err) {
-      return reply.code(err.statusCode || 500).send({ error: err.message });
+      recordAuditEvent(db, {
+        request,
+        action: 'ssh_key.create',
+        targetType: 'ssh_key',
+        targetName: request.body?.name,
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err);
     }
   });
 
   fastify.delete('/api/ssh-keys/:name', async (request, reply) => {
     try {
-      return deleteSshKey(request.params.name);
+      const key = listSshKeys().find(k => k.name === request.params.name && k.managed);
+      if (key) {
+        const usedBy = listHostsUsingIdentityFile(db, key.path);
+        if (usedBy.length > 0) {
+          return apiError(reply, 'SSH key is used by one or more hosts', 409, {
+            usedByHosts: usedBy,
+          });
+        }
+      }
+      const deleted = deleteSshKey(request.params.name);
+      recordAuditEvent(db, {
+        request,
+        action: 'ssh_key.delete',
+        targetType: 'ssh_key',
+        targetName: request.params.name,
+        details: deleted ? { path: deleted.path } : null,
+      });
+      return deleted;
     } catch (err) {
-      return reply.code(err.statusCode || 500).send({ error: err.message });
+      recordAuditEvent(db, {
+        request,
+        action: 'ssh_key.delete',
+        targetType: 'ssh_key',
+        targetName: request.params.name,
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err);
     }
   });
 
   // List all managed hosts
-  fastify.get('/api/managed-hosts', async () => {
-    const hosts = db.prepare('SELECT * FROM managed_hosts ORDER BY sort_order, name').all();
-    const groups = {};
-    for (const host of hosts) {
-      const g = host.group_name || 'Other';
-      if (!groups[g]) groups[g] = [];
-      groups[g].push(host);
+  fastify.get('/api/managed-hosts', async (_request, reply) => {
+    noStoreResponse(reply);
+    try {
+      const hosts = listManagedHostRows(db);
+      return { hosts, groups: groupManagedHostRows(hosts), count: hosts.length };
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500);
     }
-    return { hosts, groups, count: hosts.length };
   });
 
   // Get single host
   fastify.get('/api/managed-hosts/:id', async (request, reply) => {
-    const host = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
-    if (!host) return reply.code(404).send({ error: 'Host not found' });
-    return host;
+    noStoreResponse(reply);
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      const host = getManagedHostRow(db, id);
+      if (!host) return apiError(reply, 'Host not found', 404, { id });
+      return host;
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
+    }
   });
 
   // Create host
   fastify.post('/api/managed-hosts', async (request, reply) => {
-    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container, gateway_host_id } = request.body;
-    const connectionType = connection_type === 'docker' ? 'docker' : 'ssh';
-    const containerName = docker_container?.trim() || null;
-    const resolvedHostname = connectionType === 'docker' ? containerName : hostname?.trim();
-    const gatewayHostId = gateway_host_id ? Number(gateway_host_id) : null;
-    if (!name?.trim() || !resolvedHostname) {
-      return reply.code(400).send({ error: 'Name and hostname are required' });
+    const normalized = normalizeHostPayload(request.body || {});
+    if (normalized.error) return apiError(reply, normalized.error, 400);
+    const hostInput = normalized.value;
+    try {
+      if (hostInput.gateway_host_id) {
+        if (!gatewayExists(db, hostInput.gateway_host_id)) return apiError(reply, 'Gateway host not found', 400);
+      }
+
+      // Check for duplicate name
+      if (hostNameExists(db, hostInput.name)) {
+        return apiError(reply, `Host "${hostInput.name}" already exists`, 409);
+      }
+
+      const host = insertManagedHost(db, hostInput);
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.create',
+        targetType: 'managed_host',
+        targetId: host.id,
+        targetName: host.name,
+        details: {
+          connectionType: host.connection_type,
+          gatewayHostId: host.gateway_host_id,
+          enabled: !!host.enabled,
+        },
+      });
+      reply.code(201);
+      return host;
+    } catch (err) {
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.create',
+        targetType: 'managed_host',
+        targetName: hostInput.name,
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err, err.statusCode || 500, { name: hostInput.name });
     }
-    if (gatewayHostId) {
-      const gateway = db.prepare('SELECT id FROM managed_hosts WHERE id = ?').get(gatewayHostId);
-      if (!gateway) return reply.code(400).send({ error: 'Gateway host not found' });
-    }
-
-    // Check for duplicate name
-    const existing = db.prepare('SELECT id FROM managed_hosts WHERE name = ?').get(name.trim());
-    if (existing) {
-      return reply.code(409).send({ error: `Host "${name.trim()}" already exists` });
-    }
-
-    const maxSort = db.prepare('SELECT MAX(sort_order) as m FROM managed_hosts').get();
-    const nextSort = (maxSort?.m ?? -1) + 1;
-
-    const result = db.prepare(`
-      INSERT INTO managed_hosts (name, hostname, user, port, identity_file, auth_method, group_name, is_local, connection_type, docker_container, gateway_host_id, enabled, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      name.trim(),
-      resolvedHostname,
-      connectionType === 'docker' ? null : (user?.trim() || null),
-      connectionType === 'docker' ? 0 : (port || 22),
-      connectionType === 'docker' ? null : (identity_file?.trim() || null),
-      connectionType === 'docker' ? 'docker' : (auth_method || 'key'),
-      group_name?.trim() || (connectionType === 'docker' ? 'Docker' : 'Other'),
-      connectionType === 'docker' ? 0 : (is_local ? 1 : 0),
-      connectionType,
-      containerName,
-      gatewayHostId,
-      enabled !== false ? 1 : 0,
-      nextSort
-    );
-
-    const host = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(result.lastInsertRowid);
-    reply.code(201);
-    return host;
   });
 
   // Update host
   fastify.put('/api/managed-hosts/:id', async (request, reply) => {
-    const existing = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
-    if (!existing) return reply.code(404).send({ error: 'Host not found' });
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      const existing = getManagedHostRow(db, id);
+      if (!existing) return apiError(reply, 'Host not found', 404, { id });
 
-    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container, gateway_host_id } = request.body;
-    const connectionType = connection_type === 'docker' ? 'docker' : (connection_type || existing.connection_type || 'ssh');
-    const containerName = docker_container?.trim() || existing.docker_container || null;
-    const resolvedHostname = connectionType === 'docker' ? containerName : (hostname?.trim() ?? existing.hostname);
-    const gatewayHostId = gateway_host_id !== undefined && gateway_host_id !== null && gateway_host_id !== ''
-      ? Number(gateway_host_id)
-      : null;
+      const normalized = normalizeHostPayload(request.body || {}, existing);
+      if (normalized.error) return apiError(reply, normalized.error, 400, { id });
+      const hostInput = normalized.value;
 
-    // Check for name collision with other hosts
-    if (name && name.trim() !== existing.name) {
-      const dup = db.prepare('SELECT id FROM managed_hosts WHERE name = ? AND id != ?').get(name.trim(), existing.id);
-      if (dup) return reply.code(409).send({ error: `Host "${name.trim()}" already exists` });
+      // Check for name collision with other hosts
+      if (hostInput.name !== existing.name) {
+        if (hostNameExists(db, hostInput.name, existing.id)) return apiError(reply, `Host "${hostInput.name}" already exists`, 409);
+      }
+      if (hostInput.gateway_host_id) {
+        if (hostInput.gateway_host_id === existing.id) return apiError(reply, 'Host cannot use itself as gateway', 400);
+        if (!gatewayExists(db, hostInput.gateway_host_id)) return apiError(reply, 'Gateway host not found', 400);
+        if (wouldCreateGatewayCycle(db, existing.id, hostInput.gateway_host_id)) {
+          return apiError(reply, 'Gateway chain cannot contain a cycle', 400);
+        }
+      }
+
+      const updated = updateManagedHost(db, existing.id, hostInput);
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.update',
+        targetType: 'managed_host',
+        targetId: updated.id,
+        targetName: updated.name,
+        details: {
+          previousName: existing.name,
+          connectionType: updated.connection_type,
+          gatewayHostId: updated.gateway_host_id,
+          enabled: !!updated.enabled,
+        },
+      });
+      return updated;
+    } catch (err) {
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.update',
+        targetType: 'managed_host',
+        targetId: Number.isFinite(Number(id)) ? id : null,
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
     }
-    if (gatewayHostId) {
-      if (gatewayHostId === existing.id) return reply.code(400).send({ error: 'Host cannot use itself as gateway' });
-      const gateway = db.prepare('SELECT id FROM managed_hosts WHERE id = ?').get(gatewayHostId);
-      if (!gateway) return reply.code(400).send({ error: 'Gateway host not found' });
-    }
-
-    db.prepare(`
-      UPDATE managed_hosts SET
-        name = ?, hostname = ?, user = ?, port = ?, identity_file = ?,
-        auth_method = ?, group_name = ?, is_local = ?, connection_type = ?, docker_container = ?, gateway_host_id = ?, enabled = ?,
-        updated_at = datetime('now')
-      WHERE id = ?
-    `).run(
-      name?.trim() ?? existing.name,
-      resolvedHostname,
-      connectionType === 'docker' ? null : (user?.trim() ?? existing.user),
-      connectionType === 'docker' ? 0 : (port ?? existing.port),
-      connectionType === 'docker' ? null : (identity_file?.trim() ?? existing.identity_file),
-      connectionType === 'docker' ? 'docker' : (auth_method ?? existing.auth_method),
-      group_name?.trim() ?? existing.group_name,
-      connectionType === 'docker' ? 0 : (is_local !== undefined ? (is_local ? 1 : 0) : existing.is_local),
-      connectionType,
-      connectionType === 'docker' ? containerName : null,
-      gatewayHostId,
-      enabled !== undefined ? (enabled ? 1 : 0) : existing.enabled,
-      existing.id
-    );
-
-    return db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(existing.id);
   });
 
   // Delete host
   fastify.delete('/api/managed-hosts/:id', async (request, reply) => {
-    const existing = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
-    if (!existing) return reply.code(404).send({ error: 'Host not found' });
+    let existing = null;
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      existing = deleteManagedHost(db, id);
+      if (!existing) return apiError(reply, 'Host not found', 404, { id });
+    } catch (err) {
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.delete',
+        targetType: 'managed_host',
+        targetId: Number.isFinite(Number(id)) ? id : null,
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
+    }
 
-    db.prepare('DELETE FROM managed_hosts WHERE id = ?').run(existing.id);
+    recordAuditEvent(db, {
+      request,
+      action: 'managed_host.delete',
+      targetType: 'managed_host',
+      targetId: existing.id,
+      targetName: existing.name,
+    });
     return { deleted: true, name: existing.name };
   });
 
   // Import hosts from SSH config
-  fastify.post('/api/managed-hosts/import-ssh-config', async () => {
-    const sshHosts = parseSSHConfig();
-    const existing = db.prepare('SELECT name FROM managed_hosts').all().map(h => h.name);
-    const existingSet = new Set(existing);
-
-    const insertStmt = db.prepare(`
-      INSERT INTO managed_hosts (name, hostname, user, identity_file, auth_method, group_name, is_local, enabled, sort_order)
-      VALUES (?, ?, ?, ?, 'key', ?, ?, 1, ?)
-    `);
-
-    let imported = 0;
-    let skipped = 0;
-    const importTransaction = db.transaction(() => {
-      const maxSort = db.prepare('SELECT MAX(sort_order) as m FROM managed_hosts').get();
-      let nextSort = (maxSort?.m ?? -1) + 1;
-
-      for (const host of sshHosts) {
-        if (existingSet.has(host.name)) {
-          skipped++;
-          continue;
-        }
-        insertStmt.run(
-          host.name,
-          host.hostname || host.name,
-          host.user || null,
-          host.identityFile || null,
-          host.group || 'Other',
-          host.isLocal ? 1 : 0,
-          nextSort++
-        );
-        imported++;
-      }
-    });
-
-    importTransaction();
-
-    return { imported, skipped, total: existing.length + imported };
-  });
-
-  // Check if any managed hosts exist (for auto-import on first load)
-  fastify.get('/api/managed-hosts/count', async () => {
-    const result = db.prepare('SELECT COUNT(*) as count FROM managed_hosts').get();
-    return { count: result.count };
-  });
-
-  // Test connectivity and tmux availability for a single host
-  fastify.post('/api/managed-hosts/:id/test', async (request, reply) => {
-    const host = attachGateway(db, db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id));
-    if (!host) return reply.code(404).send({ error: 'Host not found' });
-
-    const result = await testHost(host);
-
-    // Update DB with test results
-    db.prepare(`
-      UPDATE managed_hosts SET
-        last_test_status = ?, last_test_at = datetime('now'), tmux_available = ?,
-        updated_at = datetime('now')
-      WHERE id = ?
-    `).run(result.status, result.tmuxAvailable ? 1 : 0, host.id);
-
-    return result;
-  });
-
-  // Install tmux on a reachable host after user confirmation in the UI
-  fastify.post('/api/managed-hosts/:id/install-tmux', async (request, reply) => {
-    const host = attachGateway(db, db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id));
-    if (!host) return reply.code(404).send({ error: 'Host not found' });
-
+  fastify.post('/api/managed-hosts/import-ssh-config', async (request, reply) => {
     try {
-      const result = await installTmux(host);
-      db.prepare(`
-        UPDATE managed_hosts SET
-          last_test_status = ?, last_test_at = datetime('now'), tmux_available = ?,
-          updated_at = datetime('now')
-        WHERE id = ?
-      `).run(result.test.status, result.test.tmuxAvailable ? 1 : 0, host.id);
+      const result = importSshConfigHosts(db, parseSSHConfig());
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.import_ssh_config',
+        targetType: 'managed_host',
+        details: result,
+      });
       return result;
     } catch (err) {
-      return reply.code(err.statusCode || 500).send({ error: err.message });
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.import_ssh_config',
+        targetType: 'managed_host',
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err, err.statusCode || 500);
     }
   });
 
-  // Test all enabled hosts in parallel
-  fastify.post('/api/managed-hosts/test-all', async () => {
-    const hosts = db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1').all().map(host => attachGateway(db, host));
+  // Check if any managed hosts exist (for auto-import on first load)
+  fastify.get('/api/managed-hosts/count', async (_request, reply) => {
+    noStoreResponse(reply);
+    try {
+      return { count: countManagedHosts(db) };
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500);
+    }
+  });
 
-    const results = await Promise.allSettled(
-      hosts.map(async (host) => {
-        const result = await testHost(host);
-        db.prepare(`
-          UPDATE managed_hosts SET
-            last_test_status = ?, last_test_at = datetime('now'), tmux_available = ?,
-            updated_at = datetime('now')
-          WHERE id = ?
-        `).run(result.status, result.tmuxAvailable ? 1 : 0, host.id);
-        return { id: host.id, name: host.name, ...result };
-      })
+  // Test connectivity and tmux availability for a single host
+  fastify.post('/api/managed-hosts/:id/test', {
+    config: {
+      rateLimit: {
+        max: HOST_TEST_RATE_LIMIT_MAX,
+        timeWindow: HOST_TEST_RATE_LIMIT_WINDOW,
+      },
+    },
+  }, async (request, reply) => {
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      const host = attachGateway(db, getManagedHostRow(db, id));
+      if (!host) return apiError(reply, 'Host not found', 404, { id });
+
+      const result = await testHost(host);
+      updateManagedHostTestResult(db, host.id, result);
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.test',
+        targetType: 'managed_host',
+        targetId: host.id,
+        targetName: host.name,
+        status: result.status === 'ok' ? 'ok' : 'error',
+        details: {
+          tmuxAvailable: result.tmuxAvailable,
+          durationMs: result.durationMs,
+          osId: result.osId,
+        },
+        error: result.error,
+      });
+      return result;
+    } catch (err) {
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.test',
+        targetType: 'managed_host',
+        targetId: Number.isFinite(Number(id)) ? id : null,
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
+    }
+  });
+
+  // Install tmux on a reachable host after user confirmation in the UI
+  fastify.post('/api/managed-hosts/:id/install-tmux', {
+    config: {
+      rateLimit: {
+        max: HOST_INSTALL_RATE_LIMIT_MAX,
+        timeWindow: HOST_INSTALL_RATE_LIMIT_WINDOW,
+      },
+    },
+  }, async (request, reply) => {
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      const host = attachGateway(db, getManagedHostRow(db, id));
+      if (!host) return apiError(reply, 'Host not found', 404, { id });
+
+      const result = await installTmux(host);
+      updateManagedHostTestResult(db, host.id, result.test);
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.install_tmux',
+        targetType: 'managed_host',
+        targetId: host.id,
+        targetName: host.name,
+        status: result.test?.status === 'ok' ? 'ok' : 'error',
+        details: {
+          installed: result.installed,
+          alreadyInstalled: result.alreadyInstalled,
+          installCommand: result.installCommand,
+        },
+        error: result.test?.error,
+      });
+      return result;
+    } catch (err) {
+      recordAuditEvent(db, {
+        request,
+        action: 'managed_host.install_tmux',
+        targetType: 'managed_host',
+        targetId: Number.isFinite(Number(id)) ? id : null,
+        status: 'error',
+        error: err.message,
+      });
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
+    }
+  });
+
+  // Test all enabled hosts with bounded parallelism
+  fastify.post('/api/managed-hosts/test-all', {
+    config: {
+      rateLimit: {
+        max: HOST_TEST_ALL_RATE_LIMIT_MAX,
+        timeWindow: HOST_TEST_ALL_RATE_LIMIT_WINDOW,
+      },
+    },
+  }, async (_request, reply) => {
+    let hosts = [];
+    try {
+      hosts = listEnabledManagedHostRows(db).map(host => attachGateway(db, host));
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500);
+    }
+
+    const results = await mapWithConcurrency(
+      hosts,
+      MANAGED_HOST_TEST_CONCURRENCY,
+      async (host) => {
+        try {
+          const result = await testHost(host);
+          updateManagedHostTestResult(db, host.id, result);
+          return { status: 'fulfilled', value: { id: host.id, name: host.name, ...result } };
+        } catch (err) {
+          return { status: 'rejected', reason: err, host };
+        }
+      }
     );
 
     const completed = results
@@ -470,8 +455,19 @@ export default async function managedHostsRoutes(fastify) {
       .map(r => r.value);
     const failed = results
       .filter(r => r.status === 'rejected')
-      .map((r, i) => ({ id: hosts[i].id, name: hosts[i].name, error: r.reason?.message }));
+      .map(r => ({ id: r.host.id, name: r.host.name, error: r.reason?.message }));
 
+    recordAuditEvent(db, {
+      request: _request,
+      action: 'managed_host.test_all',
+      targetType: 'managed_host',
+      status: failed.length ? 'error' : 'ok',
+      details: {
+        tested: completed.length,
+        failed: failed.length,
+      },
+      error: failed.length ? `${failed.length} host tests failed` : null,
+    });
     return { tested: completed.length, results: [...completed, ...failed] };
   });
 }

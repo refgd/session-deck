@@ -1,7 +1,9 @@
 <script>
   import Terminal from './Terminal.svelte';
+  import { DEFAULT_HOST } from './constants.js';
   import SplitPane from './SplitPane.svelte';
   import { translate } from './i18n.js';
+  import { paneSessionKey } from './pane-key-utils.js';
 
   let {
     node,
@@ -67,7 +69,7 @@
   }
 
   function nodeId(child) {
-    if (child.session) return `${child.host || 'reliant'}:${child.session}`;
+    if (child.session) return paneSessionKey(child.host, child.session, DEFAULT_HOST);
     return `empty:${path.join('.') || 'root'}`;
   }
 
@@ -92,8 +94,8 @@
   function handleDragOver(e) {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    const sourceSession = e.dataTransfer.types.includes('text/plain') ? true : false;
-    if (sourceSession) {
+    const hasSourcePane = e.dataTransfer.types.includes('text/plain');
+    if (hasSourcePane) {
       const zone = getDropZone(e, e.currentTarget);
       // Detect swap: if parent is splitting in the same direction as the drop zone,
       // and there are exactly 2 siblings, show swap indicator
@@ -115,11 +117,12 @@
 
   function handleDropOnPane(e) {
     e.preventDefault();
-    const sourceSession = e.dataTransfer.getData('text/plain');
+    const sourcePane = e.dataTransfer.getData('text/plain');
     const zone = dropZone;
     dropZone = null;
-    if (sourceSession && zone && sourceSession !== node.session) {
-      onDrop(sourceSession, node.session, zone);
+    const targetPane = nodeId(node);
+    if (sourcePane && targetPane && zone && sourcePane !== targetPane) {
+      onDrop(sourcePane, targetPane, zone);
     }
   }
 </script>
@@ -144,21 +147,21 @@
     {#if node.session}
       <Terminal
         session={node.session}
-        host={node.host || 'reliant'}
+        host={node.host || DEFAULT_HOST}
         focused={focusedId === nodeId(node)}
         zoomed={zoomedId === nodeId(node)}
         sessionType={node.session}
-        sessionTypeColor={getTypeInfo(node.session).color}
-        sessionTypeLabel={getTypeInfo(node.session).label}
-        sessionContext={getTypeInfo(node.session).context}
+        sessionTypeColor={getTypeInfo(node.session, node.host || DEFAULT_HOST).color}
+        sessionTypeLabel={getTypeInfo(node.session, node.host || DEFAULT_HOST).label}
+        sessionContext={getTypeInfo(node.session, node.host || DEFAULT_HOST).context}
         paneTitle={node.paneTitle || null}
         {language}
         onSessionClick={() => handleSessionClick(node.session)}
-        onZoom={() => onZoom(nodeId(node), node.session, node.host || 'reliant', path)}
+        onZoom={() => onZoom(nodeId(node), node.session, node.host || DEFAULT_HOST, path)}
         onSplit={(dir) => onSplit(path, dir)}
         onClose={() => onClose(path)}
         onDragStart={() => {}}
-        onContextMenu={(e) => onPaneContextMenu(e, path, node.session, node.host || 'reliant')}
+        onContextMenu={(e) => onPaneContextMenu(e, path, node.session, node.host || DEFAULT_HOST)}
       />
     {:else}
       <div class="empty-pane">

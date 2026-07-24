@@ -10,6 +10,10 @@
     "dev:client": "cd frontend && npm run dev",
     "dev": "npm run dev:server & npm run dev:client",
     "build": "cd frontend && npm run build",
+    "test": "node --test test/*.test.js",
+    "test:integration": "node --test integration-tests/*.test.js",
+    "audit:prod": "npm audit --omit=dev && npm --prefix frontend audit --omit=dev",
+    "verify": "npm test && npm run build && npm run audit:prod",
     "postinstall": "cd frontend && npm install"
   },
   "keywords": [
@@ -26,7 +30,7 @@
     "@fastify/helmet": "^13.0.2",
     "@fastify/rate-limit": "^10.3.0",
     "@fastify/session": "^11.1.1",
-    "@fastify/static": "^9.0.0",
+    "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "better-sqlite3": "^12.8.0",
     "fastify": "^5.8.4",

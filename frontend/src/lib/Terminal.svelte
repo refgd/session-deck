@@ -7,8 +7,13 @@
   import { Unicode11Addon } from '@xterm/addon-unicode11';
   import { subscribeStatus } from './stores/status.js';
   import { translate } from './i18n.js';
+  import { DEFAULT_HOST } from './constants.js';
+  import { paneSessionKey } from './pane-key-utils.js';
+  import { canSendTerminalInput, terminalInputModeLabel } from './terminal-input-utils.js';
 
-  let { session = 'main', host = 'reliant', focused = false, zoomed = false, sessionType = 'terminal', sessionTypeColor = '#6b7688', sessionTypeLabel = 'TERM', sessionContext = null, paneTitle = null, onSessionClick = null, onZoom = null, onSplit = null, onClose = null, onDragStart = null, onContextMenu = null, isMobile = false, onCtrlConsumed = null, language = 'en' } = $props();
+  const WS_TOKEN_PROTOCOL_PREFIX = 'sessiondeck.ws-token.';
+
+  let { session = 'main', host = DEFAULT_HOST, focused = false, zoomed = false, sessionType = 'terminal', sessionTypeColor = '#6b7688', sessionTypeLabel = 'TERM', sessionContext = null, paneTitle = null, onSessionClick = null, onZoom = null, onSplit = null, onClose = null, onDragStart = null, onContextMenu = null, isMobile = false, readOnly = false, onCtrlConsumed = null, language = 'en' } = $props();
 
   function t(key, params = {}) {
     return translate(language, key, params);
@@ -55,9 +60,9 @@
     // Fetch a short-lived WS auth token, then connect
     fetch('/api/ws-token').then(r => r.json()).then(({ token }) => {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${proto}//${window.location.host}/ws/terminal?session=${encodeURIComponent(session)}&host=${encodeURIComponent(host)}&cols=${term.cols}&rows=${term.rows}&token=${encodeURIComponent(token)}`;
+      const wsUrl = `${proto}//${window.location.host}/ws/terminal?session=${encodeURIComponent(session)}&host=${encodeURIComponent(host)}&cols=${term.cols}&rows=${term.rows}`;
 
-      ws = new WebSocket(wsUrl);
+      ws = new WebSocket(wsUrl, [`${WS_TOKEN_PROTOCOL_PREFIX}${token}`]);
 
       ws.onopen = () => {
         connected = true;
@@ -98,13 +103,18 @@
   // Sends raw bytes/escape sequences to the PTY and keeps the terminal focused
   // so the soft keyboard stays up.
   export function sendInput(data) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    if (canSendTerminalInput({ readOnly, wsReady: ws?.readyState === WebSocket.OPEN })) {
       ws.send(data);
     }
   }
 
   export function focusTerminal() {
+    if (readOnly) return;
     term?.focus();
+  }
+
+  export function scrollHistory(lines) {
+    sendScroll(lines);
   }
 
   // Arm sticky Ctrl: the next single character typed (from the soft keyboard or
@@ -144,6 +154,13 @@
     lastCols = cols;
     lastRows = rows;
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+  }
+
+  function sendScroll(lines) {
+    if (!Number.isFinite(lines) || lines === 0) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'scroll', lines }));
+    }
   }
 
   onMount(() => {
@@ -274,7 +291,7 @@
       const scrollByPixels = (deltaY) => {
         if (!term || !deltaY) return;
         const lines = Math.trunc(deltaY / lineHeight()) || (deltaY > 0 ? 1 : -1);
-        term.scrollLines(lines);
+        sendScroll(lines);
       };
 
       const scheduleTouchScroll = (deltaY) => {
@@ -306,6 +323,11 @@
 
       let lastTouchY = null;
       const onTouchStart = (event) => {
+        if (isMobile) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
         if (event.touches.length !== 1) {
           lastTouchY = null;
           return;
@@ -313,6 +335,11 @@
         lastTouchY = event.touches[0].clientY;
       };
       const onTouchMove = (event) => {
+        if (isMobile) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
         if (event.touches.length !== 1 || lastTouchY === null) return;
         const nextY = event.touches[0].clientY;
         scheduleTouchScroll(lastTouchY - nextY);
@@ -341,7 +368,7 @@
       };
     }
 
-    // Attach xterm input handlers (clipboard shortcuts + data → WebSocket).
+    // Attach xterm input handlers (clipboard handling + data to WebSocket).
     function wireInput() {
       // Clipboard handling
       term.attachCustomKeyEventHandler((ev) => {
@@ -352,12 +379,14 @@
             term.clearSelection();
             return false; // prevent terminal from getting Ctrl+C
           }
+          if (readOnly) return false;
           return true; // no selection — let SIGINT through
         }
         // Ctrl+V — paste from clipboard
         if (ev.ctrlKey && !ev.shiftKey && ev.key === 'v' && ev.type === 'keydown') {
+          if (readOnly) return false;
           navigator.clipboard.readText().then(text => {
-            if (text && ws && ws.readyState === WebSocket.OPEN) {
+            if (text && canSendTerminalInput({ readOnly, wsReady: ws?.readyState === WebSocket.OPEN })) {
               ws.send('\x1b[200~' + text + '\x1b[201~');
             }
           }).catch(() => {});
@@ -368,6 +397,7 @@
 
       // Terminal input → WebSocket
       term.onData((data) => {
+        if (readOnly) return;
         // Sticky Ctrl from the key bar: transform the next char to a control code
         if (ctrlPending) {
           ctrlPending = false;
@@ -377,7 +407,7 @@
             if (up >= 64 && up <= 95) data = String.fromCharCode(up & 0x1f); // @ A-Z [ \ ] ^ _
           }
         }
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (canSendTerminalInput({ readOnly, wsReady: ws?.readyState === WebSocket.OPEN })) {
           ws.send(data);
         }
       });
@@ -408,8 +438,8 @@
 
     // Subscribe to pane status
     unsubStatus = subscribeStatus((statusMap) => {
-      const key = `${host}:${session}`;
-      paneStatus = statusMap[key] || null;
+      const key = paneSessionKey(host, session, DEFAULT_HOST);
+      paneStatus = key ? statusMap[key] || null : null;
     });
 
     return () => {
@@ -445,11 +475,11 @@
     role="toolbar"
     tabindex="0"
     draggable="true"
-    ondragstart={(e) => {
-      e.dataTransfer.setData('text/plain', session);
-      e.dataTransfer.effectAllowed = 'move';
-      onDragStart?.(session, host);
-    }}
+	    ondragstart={(e) => {
+	      e.dataTransfer.setData('text/plain', paneSessionKey(host, session, DEFAULT_HOST));
+	      e.dataTransfer.effectAllowed = 'move';
+	      onDragStart?.(session, host);
+	    }}
     oncontextmenu={(e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -468,6 +498,9 @@
     <span class="spacer"></span>
     {#if focused}
       <span class="fbadge">{language === 'zh-CN' ? '聚焦' : 'FOCUSED'}</span>
+    {/if}
+    {#if readOnly}
+      <span class="read-only-badge">{terminalInputModeLabel(t, true)}</span>
     {/if}
     {#if connecting}
       <span class="conn-badge connecting">CONNECTING</span>
@@ -558,6 +591,11 @@
     font-size: 9px; padding: 1px 6px; border-radius: 3px;
     background: var(--accent-bg-strong, rgba(249,115,22,0.15)); color: var(--accent, #F97316);
     font-weight: 600; letter-spacing: 0.5px;
+  }
+  .read-only-badge {
+    font-size: 9px; padding: 1px 6px; border-radius: 3px;
+    background: rgba(107,118,136,0.14); color: var(--text-secondary);
+    font-weight: 600;
   }
   .conn-badge {
     font-size: 9px; padding: 1px 6px; border-radius: 3px; font-weight: 500;

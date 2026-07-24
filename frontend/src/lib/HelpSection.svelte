@@ -15,18 +15,6 @@
 
 <div class="help-section">
   <div class="help-group">
-    <span class="help-group-title">{t('workspaceNavigation')}</span>
-    <div class="help-row"><kbd>Alt+1</kbd>-<kbd>9</kbd><span>{t('switchWorkspace')}</span></div>
-    <div class="help-row"><kbd>N</kbd><span>{t('newWorkspace')}</span></div>
-    <div class="help-row"><kbd>I</kbd><span>{t('toggleProperties')}</span></div>
-  </div>
-  <div class="help-group">
-    <span class="help-group-title">{t('paneControl')}</span>
-    <div class="help-row"><kbd>Alt+Shift+1</kbd>-<kbd>9</kbd><span>{t('focusPaneIndex')}</span></div>
-    <div class="help-row"><kbd>Ctrl+Shift+F</kbd><span>{t('zoomUnzoomPane')}</span></div>
-    <div class="help-row"><kbd>Esc</kbd><span>{t('unzoomCloseMenu')}</span></div>
-  </div>
-  <div class="help-group">
     <span class="help-group-title">{t('paneActions')}</span>
     <div class="help-row"><span class="help-label">{t('changeSession')}</span><span>{t('assignDifferentSession')}</span></div>
     <div class="help-row"><span class="help-label">{t('splitHV')}</span><span>{t('splitPaneHelp')}</span></div>

@@ -1,8 +1,9 @@
 // frontend/src/lib/stores/activity.js — Workspace activity notification store
 // Polls /api/activity every 10s and tracks which workspaces have unseen output.
 
-import { getWorkspaces, getActiveId, subscribe as subscribeWorkspaces } from './workspaces.js';
+import { getWorkspaces, getActiveId } from './workspaces.js';
 import { getSessionPanes } from './layout.js';
+import { paneSessionKey } from '../pane-key-utils.js';
 
 let _pollTimer = null;
 let _listeners = [];
@@ -43,8 +44,8 @@ export function markWorkspaceSeen(workspaceId) {
   const now = Date.now();
   const sessions = getSessionPanes(ws.layout);
   for (const { session, host } of sessions) {
-    const key = `${host || 'reliant'}:${session}`;
-    _lastSeen[key] = now;
+    const key = paneSessionKey(host, session);
+    if (key) _lastSeen[key] = now;
   }
 
   if (_activeWorkspaces.has(workspaceId)) {
@@ -65,8 +66,8 @@ async function pollActivity() {
     // Update server activity map
     const newActivity = {};
     for (const entry of data.activity) {
-      const key = `${entry.host}:${entry.session}`;
-      newActivity[key] = entry.lastActivity;
+      const key = paneSessionKey(entry.host, entry.session);
+      if (key) newActivity[key] = entry.lastActivity;
     }
 
     // Determine which sessions have new activity since user last saw them
@@ -94,8 +95,8 @@ async function pollActivity() {
 
       const sessions = getSessionPanes(ws.layout);
       const hasActivity = sessions.some(({ session, host }) => {
-        const key = `${host || 'reliant'}:${session}`;
-        return changedSessions.has(key);
+        const key = paneSessionKey(host, session);
+        return key && changedSessions.has(key);
       });
 
       if (hasActivity && !_activeWorkspaces.has(ws.id)) {
@@ -114,6 +115,8 @@ async function pollActivity() {
  * Initialize the active workspace's sessions as "seen" and start polling.
  */
 export function startActivityPolling() {
+  if (_pollTimer) return;
+
   // Initialize: mark everything in the current workspace as seen
   const activeId = getActiveId();
   if (activeId) markWorkspaceSeen(activeId);
@@ -129,6 +132,7 @@ export function startActivityPolling() {
  * Stop polling.
  */
 export function stopActivityPolling() {
+  if (!_pollTimer) return;
   clearInterval(_pollTimer);
   _pollTimer = null;
 }

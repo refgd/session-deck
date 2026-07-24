@@ -1,10 +1,11 @@
 <script>
   import { translate } from './i18n.js';
+  import { DEFAULT_HOST } from './constants.js';
 
   let {
     language = 'en',
     session = null,
-    host = 'reliant',
+    host = DEFAULT_HOST,
     activeId = null,
     activeWorkspaceName = '',
     paneCount = 0,

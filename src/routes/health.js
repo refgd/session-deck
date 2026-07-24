@@ -23,12 +23,15 @@ const healthSchema = {
 };
 
 export default async function healthRoutes(fastify) {
-  fastify.get('/health', { schema: healthSchema }, async () => {
+  async function healthHandler() {
     return {
       status: 'ok',
       version: pkg.version,
       uptime: Math.floor((Date.now() - startTime) / 1000),
       timestamp: new Date().toISOString(),
     };
-  });
+  }
+
+  fastify.get('/api/health', { schema: healthSchema }, healthHandler);
+  fastify.get('/health', { schema: healthSchema }, healthHandler);
 }

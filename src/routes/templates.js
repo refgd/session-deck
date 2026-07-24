@@ -2,116 +2,151 @@
 // Templates store layout structure (splits, sizes) without session assignments.
 // When creating a workspace from a template, sessions are auto-assigned from available sessions.
 
+import { apiError } from '../lib/api-error.js';
+import { recordAuditEvent } from '../lib/audit-log.js';
+import { normalizeResourceDescription, normalizeResourceName } from '../lib/name-description-limits.js';
+import { parsePositiveRouteId } from '../lib/route-params.js';
+import { noStoreResponse } from '../lib/response-headers.js';
+import {
+  createTemplateRow,
+  deleteTemplateRow,
+  getTemplateRow,
+  listTemplateRows,
+  serializeTemplate,
+  updateTemplateRow,
+} from '../lib/template-store.js';
+
 export default async function templateRoutes(fastify) {
   const db = fastify.db;
 
   // List all templates
-  fastify.get('/api/templates', async () => {
-    const rows = db.prepare('SELECT * FROM workspace_templates ORDER BY sort_order, id').all();
-    return {
-      templates: rows.map(r => ({
-        id: r.id,
-        name: r.name,
-        description: r.description,
-        layout: JSON.parse(r.layout_json),
-        paneCount: r.pane_count,
-        createdAt: r.created_at,
-      })),
-    };
+  fastify.get('/api/templates', async (_request, reply) => {
+    noStoreResponse(reply);
+    try {
+      return {
+        templates: listTemplateRows(db).map(serializeTemplate),
+      };
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500);
+    }
   });
 
   // Create a template (typically from "Save as Template" on an existing workspace)
   fastify.post('/api/templates', async (request, reply) => {
     const { name, description, layout } = request.body || {};
-    if (!name?.trim()) return reply.code(400).send({ error: 'Name is required' });
-    if (!layout) return reply.code(400).send({ error: 'Layout is required' });
-
-    // Strip session-specific data, keep only structure
-    const templateLayout = stripSessions(layout);
-    const paneCount = countPanes(templateLayout);
+    const normalizedName = normalizeResourceName(name, { required: true });
+    if (normalizedName.error) return apiError(reply, normalizedName.error, 400);
+    const normalizedDescription = normalizeResourceDescription(description, { defaultValue: '' });
+    if (normalizedDescription.error) return apiError(reply, normalizedDescription.error, 400);
+    if (!layout) return apiError(reply, 'Layout is required', 400);
 
     try {
-      const result = db.prepare(
-        'INSERT INTO workspace_templates (name, description, layout_json, pane_count) VALUES (?, ?, ?, ?)'
-      ).run(name.trim(), description || '', JSON.stringify(templateLayout), paneCount);
+      const created = createTemplateRow(db, { name: normalizedName.value, description: normalizedDescription.value, layout });
 
-      fastify.log.info({ id: result.lastInsertRowid, name: name.trim(), paneCount }, 'Template created');
+      fastify.log.info({ id: created.row.id, name: normalizedName.value, paneCount: created.paneCount }, 'Template created');
+      recordAuditEvent(db, {
+        request,
+        action: 'template.create',
+        targetType: 'template',
+        targetId: created.row.id,
+        targetName: normalizedName.value,
+        details: { paneCount: created.paneCount },
+      });
       return reply.code(201).send({
-        id: result.lastInsertRowid,
-        name: name.trim(),
-        description: description || '',
-        layout: templateLayout,
-        paneCount,
+        id: created.row.id,
+        name: normalizedName.value,
+        description: normalizedDescription.value,
+        layout: created.layout,
+        paneCount: created.paneCount,
       });
     } catch (err) {
-      if (err.message.includes('UNIQUE')) {
-        return reply.code(409).send({ error: `Template "${name.trim()}" already exists` });
+      recordAuditEvent(db, {
+        request,
+        action: 'template.create',
+        targetType: 'template',
+        targetName: normalizedName.value,
+        status: 'error',
+        error: err.message,
+      });
+      if (err.statusCode) return apiError(reply, err, err.statusCode);
+      if (err.message?.includes('UNIQUE')) {
+        return apiError(reply, `Template "${normalizedName.value}" already exists`, 409, { name: normalizedName.value });
       }
-      throw err;
+      return apiError(reply, err, 500, { name: normalizedName.value });
     }
   });
 
   // Rename a template
   fastify.put('/api/templates/:id', async (request, reply) => {
     const { name, description } = request.body || {};
-    const row = db.prepare('SELECT * FROM workspace_templates WHERE id = ?').get(request.params.id);
-    if (!row) return reply.code(404).send({ error: 'Template not found' });
-
-    const updates = [];
-    const params = [];
-    if (name) { updates.push('name = ?'); params.push(name.trim()); }
-    if (description !== undefined) { updates.push('description = ?'); params.push(description); }
-    if (!updates.length) return reply.code(400).send({ error: 'Nothing to update' });
-    params.push(request.params.id);
-
+    const updates = {};
+    let id = request.params.id;
     try {
-      db.prepare(`UPDATE workspace_templates SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+      id = parsePositiveRouteId(request.params.id);
+      const row = getTemplateRow(db, id);
+      if (!row) return apiError(reply, 'Template not found', 404, { id });
+
+      if (name !== undefined) {
+        const normalizedName = normalizeResourceName(name, { required: true });
+        if (normalizedName.error) return apiError(reply, normalizedName.error, 400);
+        updates.name = normalizedName.value;
+      }
+      if (description !== undefined) {
+        const normalizedDescription = normalizeResourceDescription(description);
+        if (normalizedDescription.error) return apiError(reply, normalizedDescription.error, 400);
+        updates.description = normalizedDescription.value;
+      }
+      const changed = updateTemplateRow(db, id, updates);
+      if (!changed) return apiError(reply, 'Nothing to update', 400, { id });
+      recordAuditEvent(db, {
+        request,
+        action: 'template.update',
+        targetType: 'template',
+        targetId: id,
+        targetName: updates.name || row.name,
+        details: {
+          renamed: updates.name !== undefined && updates.name !== row.name,
+          descriptionChanged: updates.description !== undefined,
+        },
+      });
       return { success: true };
     } catch (err) {
-      if (err.message.includes('UNIQUE')) {
-        return reply.code(409).send({ error: `Template "${name}" already exists` });
+      recordAuditEvent(db, {
+        request,
+        action: 'template.update',
+        targetType: 'template',
+        targetId: Number.isFinite(Number(id)) ? id : null,
+        targetName: updates.name,
+        status: 'error',
+        error: err.message,
+      });
+      if (err.message?.includes('UNIQUE')) {
+        return apiError(reply, `Template "${updates.name}" already exists`, 409, { name: updates.name });
       }
-      throw err;
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
     }
   });
 
   // Delete a template
   fastify.delete('/api/templates/:id', async (request, reply) => {
-    const row = db.prepare('SELECT * FROM workspace_templates WHERE id = ?').get(request.params.id);
-    if (!row) return reply.code(404).send({ error: 'Template not found' });
+    let row = null;
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      row = deleteTemplateRow(db, id);
+      if (!row) return apiError(reply, 'Template not found', 404, { id });
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
+    }
 
-    db.prepare('DELETE FROM workspace_templates WHERE id = ?').run(request.params.id);
-    fastify.log.info({ id: request.params.id, name: row.name }, 'Template deleted');
+    fastify.log.info({ id, name: row.name }, 'Template deleted');
+    recordAuditEvent(db, {
+      request,
+      action: 'template.delete',
+      targetType: 'template',
+      targetId: row.id,
+      targetName: row.name,
+    });
     return { success: true, name: row.name };
   });
-}
-
-/**
- * Strip session-specific data from a layout tree.
- * Preserves: split direction, sizes, children structure.
- * Replaces session names with numbered placeholders.
- */
-function stripSessions(node, counter = { n: 0 }) {
-  if (node.session) {
-    counter.n++;
-    return {
-      session: `pane-${counter.n}`,
-      host: 'reliant',
-      ...(node.size ? { size: node.size } : {}),
-    };
-  }
-  if (node.children) {
-    return {
-      direction: node.direction,
-      ...(node.size ? { size: node.size } : {}),
-      children: node.children.map(c => stripSessions(c, counter)),
-    };
-  }
-  return node;
-}
-
-function countPanes(node) {
-  if (node.session) return 1;
-  if (node.children) return node.children.reduce((sum, c) => sum + countPanes(c), 0);
-  return 0;
 }

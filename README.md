@@ -28,7 +28,8 @@ Session Deck gives you a browser-based dashboard for your tmux sessions. Each pa
 - 📐 Split-tree workspace layouts with drag-to-resize borders
 - 🔀 Drag-and-drop pane rearrangement (swap or directional split)
 - 🗂️ Multiple workspaces with split panes you can build up as needed
-- 🌐 Multi-host support — manage tmux on any SSH-accessible machine
+- 🌐 Multi-host support — manage tmux on local, SSH, and Docker targets
+- 🔑 Managed SSH keys and optional SSH/Docker access gateways
 - 🔔 Activity notifications — pulsing badge when background workspaces have new output
 - 🔍 SSH connectivity testing with tmux detection and setup guidance
 - ⌨️ Keyboard shortcuts for everything
@@ -44,6 +45,7 @@ Session Deck gives you a browser-based dashboard for your tmux sessions. Each pa
 - **Node.js 20+** on the host machine
 - **tmux** installed on at least one host
 - **SSH access** to any remote hosts you want to manage (key-based auth recommended)
+- **Docker CLI access** if you want to manage tmux sessions inside containers
 
 ### Install
 
@@ -66,9 +68,9 @@ SESSION_DECK_PORT=3000 npm start
 
 Open `http://<your-host>:7890` in a browser. On first launch, the setup wizard walks you through:
 
-1. **Import hosts** from your `~/.ssh/config` (or add them manually)
-2. **Test connectivity** — verify SSH access and tmux availability
-3. **Create your first workspace** with a layout preset
+1. **Create the first administrator account**
+2. **Import hosts** from your `~/.ssh/config` or add SSH/Docker hosts manually
+3. **Create your first workspace** and add sessions to empty panes
 
 ### Development Mode
 
@@ -78,6 +80,39 @@ npm run dev
 ```
 
 Backend runs on `:7890`, frontend dev server on `:5173` with API proxy.
+
+### Testing
+
+```bash
+# Recommended pre-commit/pre-release check
+npm run verify
+
+# Unit and static behavior tests
+npm test
+
+# Production frontend build
+npm run build
+
+# Production dependency audit for backend and frontend
+npm run audit:prod
+```
+
+Real tmux/Docker/SSH integration checks are opt-in so regular test runs do not require host services:
+
+```bash
+# Local tmux lifecycle: create, list, capture, delete
+SESSION_DECK_RUN_INTEGRATION=1 npm run test:integration
+
+# Also query the local Docker daemon
+SESSION_DECK_RUN_INTEGRATION=1 SESSION_DECK_INTEGRATION_DOCKER=1 npm run test:integration
+
+# Also test an SSH host
+SESSION_DECK_RUN_INTEGRATION=1 \
+SESSION_DECK_INTEGRATION_SSH_HOST=server.example \
+SESSION_DECK_INTEGRATION_SSH_USER=ops \
+SESSION_DECK_INTEGRATION_SSH_KEY=/path/to/key \
+npm run test:integration
+```
 
 ## Configuration
 
@@ -93,6 +128,8 @@ Backend runs on `:7890`, frontend dev server on `:5173` with API proxy.
 | `SESSION_DECK_AUTH_PASS` | — | Optional first-run admin password |
 | `SESSION_DECK_SESSION_SECRET` | Auto-generated in `data/session-secret` | Session cookie secret; set explicitly for managed production deployments |
 | `SESSION_DECK_SESSION_MAX_AGE` | `86400` | Session cookie max age in seconds |
+| `SESSION_DECK_HTTPS` | `auto` | `auto`, `true`, or `false`. Auto enables HTTPS-only headers for HTTPS requests while keeping local HTTP usable |
+| `SESSION_DECK_TRUST_PROXY` | `false` | Trust `X-Forwarded-*` headers; enable only behind a trusted reverse proxy |
 
 ### Authentication
 
@@ -112,6 +149,9 @@ If `SESSION_DECK_SESSION_SECRET` is omitted, Session Deck generates a random per
 ### Security Notes
 
 - Session Deck can execute commands inside configured tmux hosts by design. Only expose it on trusted networks or behind a reverse proxy with HTTPS.
+- Leave `SESSION_DECK_HTTPS=auto` for most deployments. HTTP requests stay HTTP-compatible; HTTPS requests get secure cookies plus HTTPS upgrade headers. If HTTPS is terminated by nginx before proxying to Session Deck over HTTP, also set `SESSION_DECK_TRUST_PROXY=true` and pass `X-Forwarded-Proto`.
+- Set `SESSION_DECK_HTTPS=false` only when you need to force-disable HTTPS-specific behavior.
+- Leave `SESSION_DECK_TRUST_PROXY=false` unless every request reaches Session Deck through a reverse proxy that you control. This does not bypass authentication.
 - Mounting `/var/run/docker.sock` enables Docker container support, but it effectively grants control over the host Docker daemon to authenticated Session Deck users.
 - Managed SSH private keys are stored under the data directory with `0600` permissions. Keep the `data/` directory private and out of source control.
 - The app has no anonymous mode: first launch requires account setup, and all API/WebSocket routes require authentication after setup.
@@ -176,9 +216,21 @@ Session Deck connects to remote hosts via SSH to manage tmux sessions. For each 
    ssh user@remote-host "echo ok"
    ```
 
-4. **Add to Session Deck** via Settings → Servers → Add Host (or import from SSH config).
+4. **Add to Session Deck** via Settings -> Servers -> Add Host (or import from SSH config).
 
 Session Deck reads `~/.ssh/config` for the user running the service. Hosts defined there can be imported with one click.
+
+Managed SSH keys can also be added in Settings -> SSH Keys, then selected when adding or editing an SSH host.
+
+### Docker Hosts and Gateways
+
+Docker hosts represent running containers that have `tmux` installed. When Docker support is available, Settings -> Servers can list running containers from:
+
+- The local Docker daemon
+- A Docker daemon reached through an SSH gateway
+- A Docker gateway container that can run the Docker CLI
+
+Access gateways are optional. Use them when the target SSH host or Docker daemon is only reachable through another SSH host or container.
 
 ### Installing tmux on Remote Hosts
 
@@ -245,6 +297,7 @@ Click the **SESSION DECK** logo in the top-left to access:
 
 - **Servers** — Add, edit, remove, and test SSH hosts
   ![Server management](docs/screenshots/servers.png)
+- **SSH Keys** — Add and remove managed private keys used by SSH hosts
 - **Sessions** — Create, rename, and kill tmux sessions (with per-host filtering)
   ![Session management](docs/screenshots/sessions.png)
 - **Appearance** — Accent color picker and session type colors
@@ -267,8 +320,10 @@ Session Deck Server (Node.js)
     ├── WebSocket — terminal I/O via node-pty
     ├── tmux CLI — local session management
     ├── SSH → remote tmux CLI → sessions on other hosts
+    ├── Docker CLI → tmux sessions inside selected containers
+    ├── Access gateways → SSH or Docker hop before the target
     ├── SSH config parser → host discovery
-    └── SQLite — workspaces, hosts, layout presets
+    └── SQLite — workspaces, hosts, templates, settings
 ```
 
 ### Tech Stack
@@ -297,7 +352,10 @@ Session Deck Server (Node.js)
 | DELETE | `/api/managed-hosts/:id` | Delete a host |
 | POST | `/api/managed-hosts/import-ssh-config` | Import hosts from SSH config |
 | POST | `/api/managed-hosts/:id/test` | Test host connectivity |
+| POST | `/api/managed-hosts/:id/install-tmux` | Install tmux after user confirmation |
 | POST | `/api/managed-hosts/test-all` | Test all hosts |
+| GET | `/api/docker/containers` | List running Docker containers |
+| GET | `/api/ssh-keys` | List managed and discovered SSH keys |
 | GET | `/api/activity` | Session activity timestamps (lightweight polling) |
 | GET | `/api/settings` | App settings |
 | GET | `/api/session-types` | Session type color mappings |

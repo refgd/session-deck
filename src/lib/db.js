@@ -19,9 +19,7 @@ export function getDb() {
 
   db = new Database(config.dbPath);
 
-  // WAL mode for better concurrent reads
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+  configureDatabase(db);
 
   // Run migrations
   migrate(db);
@@ -37,6 +35,14 @@ export function closeDb() {
     db.close();
     db = undefined;
   }
+}
+
+export function configureDatabase(database) {
+  // WAL allows readers and one writer to coexist, which fits the UI's polling pattern.
+  database.pragma('journal_mode = WAL');
+  database.pragma('synchronous = NORMAL');
+  database.pragma('busy_timeout = 5000');
+  database.pragma('foreign_keys = ON');
 }
 
 function migrate(db) {
@@ -91,6 +97,13 @@ function migrate(db) {
       last_test_status TEXT,
       last_test_at TEXT,
       tmux_available INTEGER,
+      last_test_error TEXT,
+      last_test_steps_json TEXT,
+      last_test_os TEXT,
+      last_test_os_id TEXT,
+      last_test_tmux_version TEXT,
+      last_test_install_command TEXT,
+      last_test_duration_ms INTEGER,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (gateway_host_id) REFERENCES managed_hosts(id) ON DELETE SET NULL
@@ -119,6 +132,20 @@ function migrate(db) {
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       last_login_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor TEXT,
+      action TEXT NOT NULL,
+      target_type TEXT,
+      target_id TEXT,
+      target_name TEXT,
+      status TEXT NOT NULL DEFAULT 'ok',
+      details_json TEXT,
+      error TEXT,
+      ip TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   // Migration: add sort_order if missing (for existing DBs)
@@ -144,6 +171,23 @@ function migrate(db) {
     db.prepare('SELECT gateway_host_id FROM managed_hosts LIMIT 1').get();
   } catch {
     db.exec('ALTER TABLE managed_hosts ADD COLUMN gateway_host_id INTEGER REFERENCES managed_hosts(id) ON DELETE SET NULL');
+  }
+
+  const managedHostTestColumns = [
+    ['last_test_error', 'TEXT'],
+    ['last_test_steps_json', 'TEXT'],
+    ['last_test_os', 'TEXT'],
+    ['last_test_os_id', 'TEXT'],
+    ['last_test_tmux_version', 'TEXT'],
+    ['last_test_install_command', 'TEXT'],
+    ['last_test_duration_ms', 'INTEGER'],
+  ];
+  for (const [column, type] of managedHostTestColumns) {
+    try {
+      db.prepare(`SELECT ${column} FROM managed_hosts LIMIT 1`).get();
+    } catch {
+      db.exec(`ALTER TABLE managed_hosts ADD COLUMN ${column} ${type}`);
+    }
   }
 
   // Seed default session types if empty

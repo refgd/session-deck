@@ -18,11 +18,13 @@ export function mapManagedHost(h) {
   };
 }
 
-function attachGateway(db, host) {
-  if (!host?.gatewayHostId) return host;
-  const gateway = db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1 AND id = ?').get(host.gatewayHostId);
-  if (!gateway || gateway.id === host.id) return host;
-  return { ...host, gatewayHost: mapManagedHost(gateway) };
+export function attachGateway(db, host) {
+  if (!host) return host;
+  const normalized = host.connectionType ? host : mapManagedHost(host);
+  if (!normalized.gatewayHostId) return normalized;
+  const gateway = db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1 AND id = ?').get(normalized.gatewayHostId);
+  if (!gateway || gateway.id === normalized.id) return normalized;
+  return { ...normalized, gatewayHost: mapManagedHost(gateway) };
 }
 
 export function getManagedHosts(db, { enabledOnly = true } = {}) {

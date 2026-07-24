@@ -11,8 +11,11 @@
     ['servers', 'servers-icon', 'servers', 'manageHosts'],
     ['keys', 'keys-icon', 'sshKeys', 'manageSshKeys'],
     ['sessions', 'sessions-icon', 'sessions', 'tmuxSessions'],
+    ['diagnostics', 'diagnostics-icon', 'diagnostics', 'diagnosticsMenuHint'],
+    ['audit', 'audit-icon', 'auditLog', 'auditLogMenuHint'],
     ['appearance', 'appearance-icon', 'appearance', 'colorsTheme'],
-    ['help', 'help-icon', 'help', 'shortcutsDocs'],
+    ['data', 'data-icon', 'data', 'backupMigration'],
+    ['help', 'help-icon', 'help', 'helpDocs'],
   ];
 </script>
 
@@ -55,7 +58,10 @@
   .servers-icon::before,
   .keys-icon::before,
   .sessions-icon::before,
+  .diagnostics-icon::before,
+  .audit-icon::before,
   .appearance-icon::before,
+  .data-icon::before,
   .help-icon::before {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700;
@@ -63,6 +69,9 @@
   .servers-icon::before { content: '#'; }
   .keys-icon::before { content: '~'; }
   .sessions-icon::before { content: '$'; }
+  .diagnostics-icon::before { content: '!'; }
+  .audit-icon::before { content: '@'; }
   .appearance-icon::before { content: '*'; }
+  .data-icon::before { content: '%'; }
   .help-icon::before { content: '?'; }
 </style>

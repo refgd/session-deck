@@ -11,7 +11,7 @@ export function sshBaseArgs(host, { timeoutMs = 5000, tty = false, sendEnv = fal
 
   if (sendEnv) args.push('-o', 'SendEnv=LANG LC_ALL');
   if (host.identityFile || host.identity_file) {
-    args.push('-i', String(host.identityFile || host.identity_file).replace('~', process.env.HOME));
+    args.push('-i', expandHomePath(host.identityFile || host.identity_file));
   }
   if (host.port && host.port !== 22) args.push('-p', String(host.port));
 
@@ -106,13 +106,21 @@ export function shellJoin(args) {
   return args.map(shellQuote).join(' ');
 }
 
+export function expandHomePath(value) {
+  const path = String(value);
+  const home = process.env.HOME || '';
+  if (path === '~') return home;
+  if (path.startsWith('~/')) return `${home}${path.slice(1)}`;
+  return path;
+}
+
 function sshProxyCommand(gateway) {
   const args = [
     'ssh',
     '-o', 'BatchMode=yes',
     '-o', 'StrictHostKeyChecking=accept-new',
   ];
-  if (gateway.identityFile) args.push('-i', String(gateway.identityFile).replace('~', process.env.HOME));
+  if (gateway.identityFile) args.push('-i', expandHomePath(gateway.identityFile));
   if (gateway.port && gateway.port !== 22) args.push('-p', String(gateway.port));
   args.push(sshTarget(gateway), '-W', '%h:%p');
   return shellJoin(args);

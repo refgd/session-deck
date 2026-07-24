@@ -1,5 +1,10 @@
 // frontend/src/lib/stores/workspaces.js — Workspace state management
 
+import { DEFAULT_HOST } from '../constants.js';
+import { apiJson, apiOk } from '../api-client.js';
+import { logError } from '../logger.js';
+import { getLeafAtPath } from './layout.js';
+
 let _workspaces = [];
 let _activeId = null;
 let _listeners = [];
@@ -23,15 +28,14 @@ export function getActiveWorkspace() {
 
 export async function loadWorkspaces() {
   try {
-    const res = await fetch('/api/workspaces');
-    const data = await res.json();
+    const data = await apiJson('/api/workspaces');
     _workspaces = data.workspaces || [];
     if (!_activeId && _workspaces.length) {
       _activeId = _workspaces[0].id;
     }
     notify();
   } catch (e) {
-    console.error('Failed to load workspaces:', e);
+    logError('Failed to load workspaces:', e);
   }
 }
 
@@ -54,19 +58,13 @@ export async function updatePaneSession(workspaceId, path, session, host) {
   const ws = _workspaces.find(w => w.id === workspaceId);
   if (!ws) return;
 
-  // Walk the tree using the path (array of child indices)
-  let node = ws.layout;
-  for (let i = 0; i < path.length - 1; i++) {
-    node = node.children[path[i]];
-  }
-  const leaf = node.children ? node.children[path[path.length - 1]] : node;
+  const leaf = getLeafAtPath(ws.layout, path);
+  if (!leaf) return;
 
-  if (leaf) {
-    leaf.session = session;
-    leaf.host = host || 'reliant';
-    notify();
-    debouncedSave(workspaceId, ws.layout);
-  }
+  leaf.session = session;
+  leaf.host = host || DEFAULT_HOST;
+  notify();
+  debouncedSave(workspaceId, ws.layout);
 }
 
 /**
@@ -77,22 +75,13 @@ export function updatePaneTitle(workspaceId, path, title) {
   const ws = _workspaces.find(w => w.id === workspaceId);
   if (!ws) return;
 
-  let node = ws.layout;
-  if (path.length === 0) {
-    // Root node is the leaf
-    node.paneTitle = title || undefined;
+  const leaf = getLeafAtPath(ws.layout, path);
+  if (!leaf) return;
+
+  if (title) {
+    leaf.paneTitle = title;
   } else {
-    for (let i = 0; i < path.length - 1; i++) {
-      node = node.children[path[i]];
-    }
-    const leaf = node.children ? node.children[path[path.length - 1]] : node;
-    if (leaf) {
-      if (title) {
-        leaf.paneTitle = title;
-      } else {
-        delete leaf.paneTitle;
-      }
-    }
+    delete leaf.paneTitle;
   }
 
   notify();
@@ -107,7 +96,7 @@ export function renameSessionInWorkspaces(oldName, newName, host) {
   let changed = false;
 
   function walkAndRename(node) {
-    if (node.session === oldName && (node.host || 'reliant') === (host || 'reliant')) {
+    if (node.session === oldName && (node.host || DEFAULT_HOST) === (host || DEFAULT_HOST)) {
       node.session = newName;
       changed = true;
     }
@@ -129,36 +118,31 @@ export function renameSessionInWorkspaces(oldName, newName, host) {
 
 export async function createWorkspace(name, layout, description) {
   try {
-    const res = await fetch('/api/workspaces', {
+    const data = await apiJson('/api/workspaces', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, layout, description }),
+      body: { name, layout, description },
     });
-    if (!res.ok) throw new Error((await res.json()).error);
-    const data = await res.json();
     _workspaces.push({ ...data, isDefault: false });
     _activeId = data.id;
     notify();
     return data;
   } catch (e) {
-    console.error('Failed to create workspace:', e);
+    logError('Failed to create workspace:', e);
     throw e;
   }
 }
 
 export async function renameWorkspace(id, name) {
   try {
-    const res = await fetch(`/api/workspaces/${id}`, {
+    await apiOk(`/api/workspaces/${id}`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: { name },
     });
-    if (!res.ok) throw new Error((await res.json()).error);
     const ws = _workspaces.find(w => w.id === id);
     if (ws) ws.name = name;
     notify();
   } catch (e) {
-    console.error('Failed to rename workspace:', e);
+    logError('Failed to rename workspace:', e);
     throw e;
   }
 }
@@ -174,15 +158,14 @@ export async function duplicateWorkspace(id) {
 
 export async function deleteWorkspace(id) {
   try {
-    const res = await fetch(`/api/workspaces/${id}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error((await res.json()).error);
+    await apiOk(`/api/workspaces/${id}`, { method: 'DELETE' });
     _workspaces = _workspaces.filter(w => w.id !== id);
     if (_activeId === id) {
       _activeId = _workspaces[0]?.id || null;
     }
     notify();
   } catch (e) {
-    console.error('Failed to delete workspace:', e);
+    logError('Failed to delete workspace:', e);
     throw e;
   }
 }
@@ -191,13 +174,12 @@ function debouncedSave(id, layout) {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(async () => {
     try {
-      await fetch(`/api/workspaces/${id}`, {
+      await apiOk(`/api/workspaces/${id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ layout }),
+        body: { layout },
       });
     } catch (e) {
-      console.error('Failed to save layout:', e);
+      logError('Failed to save layout:', e);
     }
   }, 1000);
 }

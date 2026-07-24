@@ -1,11 +1,13 @@
 // src/routes/hosts.js — hosts API (reads from managed_hosts table)
 
+import { noStoreResponse } from '../lib/response-headers.js';
 import { getManagedHosts } from '../services/hosts.js';
 
 export default async function hostsRoutes(fastify) {
   const db = fastify.db;
 
-  fastify.get('/api/hosts', async () => {
+  fastify.get('/api/hosts', async (_request, reply) => {
+    noStoreResponse(reply);
     const mapped = getManagedHosts(db);
 
     const groups = {};

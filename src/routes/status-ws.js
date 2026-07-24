@@ -6,18 +6,14 @@
 
 import statusEngine from '../services/status-engine.js';
 import { hasUsers } from '../lib/auth.js';
+import { authorizeWebSocketRequest, logRejectedWebSocket } from '../lib/ws-utils.js';
 
 export default async function statusWsRoutes(fastify) {
   fastify.get('/ws/status', { websocket: true }, (socket, req) => {
-    // Auth check — same policy as terminal WebSocket
-    if (!hasUsers(fastify.db)) {
-      socket.close(1008, 'Setup required');
-      return;
-    }
-    const isAuthenticated = req.session?.authenticated;
-    if (!isAuthenticated) {
-      fastify.log.warn({ ip: req.ip }, 'Status WebSocket auth rejected');
-      socket.close(1008, 'Authentication required');
+    const authorization = authorizeWebSocketRequest(req, { db: fastify.db, hasUsers });
+    if (!authorization.ok) {
+      logRejectedWebSocket(fastify, req, authorization, 'Status');
+      socket.close(authorization.code, authorization.reason);
       return;
     }
 

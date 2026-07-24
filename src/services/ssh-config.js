@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { DEFAULT_HOST } from '../lib/constants.js';
 
 /**
  * Default host group assignments. Comment headers in ssh config are used as hints,
@@ -54,13 +55,13 @@ export function parseSSHConfig(configPath) {
     if (trimmed.startsWith('#') || trimmed === '') continue;
 
     // Host line starts a new entry
-    if (trimmed.startsWith('Host ')) {
+    if (/^host\s+/i.test(trimmed)) {
       // Save previous host if exists
       if (currentHost) {
         hosts.push(finalizeHost(currentHost, currentGroupHint));
       }
 
-      const aliases = trimmed.slice(5).trim().split(/\s+/);
+      const aliases = trimmed.replace(/^host\s+/i, '').trim().split(/\s+/);
 
       // Skip wildcard entries
       if (aliases.includes('*')) {
@@ -84,17 +85,17 @@ export function parseSSHConfig(configPath) {
     // Indented config lines belong to current host
     if (currentHost && trimmed.includes(' ')) {
       const spaceIdx = trimmed.indexOf(' ');
-      const key = trimmed.slice(0, spaceIdx).trim();
+      const key = trimmed.slice(0, spaceIdx).trim().toLowerCase();
       const value = trimmed.slice(spaceIdx + 1).trim();
 
       switch (key) {
-        case 'HostName':
+        case 'hostname':
           currentHost.hostname = value;
           break;
-        case 'User':
+        case 'user':
           currentHost.user = value;
           break;
-        case 'IdentityFile':
+        case 'identityfile':
           currentHost.identityFile = value;
           break;
       }
@@ -106,11 +107,11 @@ export function parseSSHConfig(configPath) {
     hosts.push(finalizeHost(currentHost, currentGroupHint));
   }
 
-  // Add localhost (reliant) as implicit host
+  // Add the default local host as an implicit host
   const hasLocalhost = hosts.some(h => h.isLocal);
   if (!hasLocalhost) {
     hosts.unshift({
-      name: 'reliant',
+      name: DEFAULT_HOST,
       aliases: ['localhost'],
       hostname: '127.0.0.1',
       user: 'claude',
@@ -125,11 +126,13 @@ export function parseSSHConfig(configPath) {
 
 function finalizeHost(host, _fallbackGroupHint) {
   const group = DEFAULT_GROUPS[host.name] || inferGroup(host._groupHint) || 'Other';
+  const hostname = host.hostname || host.name;
   const { _groupHint, ...rest } = host;
   return {
     ...rest,
+    hostname,
     group,
-    isLocal: host.hostname === '127.0.0.1' || host.hostname === '192.168.150.120',
+    isLocal: isLocalHost(host.name, hostname),
   };
 }
 
@@ -141,4 +144,9 @@ function inferGroup(hint) {
 
 function isIP(str) {
   return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(str);
+}
+
+function isLocalHost(name, hostname) {
+  return [DEFAULT_HOST, 'localhost'].includes(name) ||
+    ['127.0.0.1', 'localhost', '::1', '192.168.150.120'].includes(hostname);
 }

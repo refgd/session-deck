@@ -8,7 +8,7 @@
 
   import { translate } from './i18n.js';
 
-  let { onKey = () => {}, onShowKeyboard = () => {}, onCtrlToggle = () => {}, language = 'en' } = $props();
+  let { onKey = () => {}, onScroll = () => {}, onShowKeyboard = () => {}, onCtrlToggle = () => {}, readOnly = false, language = 'en' } = $props();
 
   function t(key, params = {}) {
     return translate(language, key, params);
@@ -24,18 +24,20 @@
 
   // Control / navigation keys
   const ESC = '\x1b';
-  const NAV_KEYS = [
+  const CONTROL_KEYS = [
     { label: 'Esc', seq: ESC, wide: true },
     { label: 'Tab', seq: '\t' },
     { label: '⌃C', seq: '\x03', titleKey: 'interrupt' },
     { label: '⌫', seq: '\x7f', titleKey: 'backspace' },
+    { label: '↵', seq: '\r', accent: true, titleKey: 'enter' },
+  ];
+  const NAV_KEYS = [
     { label: '←', seq: ESC + '[D' },
     { label: '↑', seq: ESC + '[A' },
     { label: '↓', seq: ESC + '[B' },
     { label: '→', seq: ESC + '[C' },
-    { label: 'PgUp', seq: ESC + '[5~', titleKey: 'pageUp', page: true },
-    { label: 'PgDn', seq: ESC + '[6~', titleKey: 'pageDown', page: true },
-    { label: '↵', seq: '\r', accent: true, titleKey: 'enter' },
+    { label: 'PgUp', scroll: -24, titleKey: 'pageUp', page: true },
+    { label: 'PgDn', scroll: 24, titleKey: 'pageDown', page: true },
   ];
 
   const NUMBERS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
@@ -56,37 +58,57 @@
 </script>
 
 <div class="keybar" role="toolbar" aria-label={t('terminalKeyBar')} tabindex="-1" onpointerdown={(e) => e.preventDefault()}>
+  {#if readOnly}
+    <div class="read-only-note">{t('readOnly')}</div>
+  {/if}
+  {#if !readOnly}
+    <div class="keybar-row">
+      {#each CONTROL_KEYS as k}
+        <button
+          class="key"
+          class:wide={k.wide}
+          class:accent={k.accent}
+          title={k.titleKey ? t(k.titleKey) : k.label}
+          onpointerdown={(e) => { e.preventDefault(); tapKey(k.seq); }}
+        >{k.label}</button>
+      {/each}
+      <button
+        class="key ctrl"
+        class:armed={ctrlActive}
+        title={t('ctrlNext')}
+        onpointerdown={(e) => { e.preventDefault(); toggleCtrl(); }}
+      >Ctrl</button>
+      <button
+        class="key kbd"
+        title={t('showKeyboard')}
+        onpointerdown={(e) => { e.preventDefault(); onShowKeyboard(); }}
+      >⌨</button>
+    </div>
+  {/if}
   <div class="keybar-row">
     {#each NAV_KEYS as k}
-      <button
-        class="key"
-        class:wide={k.wide}
-        class:accent={k.accent}
-        class:page={k.page}
-        title={k.titleKey ? t(k.titleKey) : k.label}
-        onpointerdown={(e) => { e.preventDefault(); tapKey(k.seq); }}
-      >{k.label}</button>
-    {/each}
-    <button
-      class="key ctrl"
-      class:armed={ctrlActive}
-      title={t('ctrlNext')}
-      onpointerdown={(e) => { e.preventDefault(); toggleCtrl(); }}
-    >Ctrl</button>
-    <button
-      class="key kbd"
-      title={t('showKeyboard')}
-      onpointerdown={(e) => { e.preventDefault(); onShowKeyboard(); }}
-    >⌨</button>
-  </div>
-  <div class="keybar-row numbers">
-    {#each NUMBERS as n}
-      <button
-        class="key num"
-        onpointerdown={(e) => { e.preventDefault(); tapKey(n); }}
-      >{n}</button>
+      {#if !readOnly || k.page}
+        <button
+          class="key"
+          class:wide={k.wide}
+          class:accent={k.accent}
+          class:page={k.page}
+          title={k.titleKey ? t(k.titleKey) : k.label}
+          onpointerdown={(e) => { e.preventDefault(); k.scroll ? onScroll(k.scroll) : tapKey(k.seq); }}
+        >{k.label}</button>
+      {/if}
     {/each}
   </div>
+  {#if !readOnly}
+    <div class="keybar-row numbers">
+      {#each NUMBERS as n}
+        <button
+          class="key num"
+          onpointerdown={(e) => { e.preventDefault(); tapKey(n); }}
+        >{n}</button>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -107,6 +129,12 @@
   .keybar-row {
     display: flex;
     gap: 4px;
+  }
+  .read-only-note {
+    color: var(--text-muted);
+    font-size: 11px;
+    text-align: center;
+    font-family: 'DM Sans', sans-serif;
   }
   .key {
     flex: 1;

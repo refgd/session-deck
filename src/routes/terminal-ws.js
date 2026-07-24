@@ -5,61 +5,61 @@ import { findHost } from '../services/hosts.js';
 import { scrollSession } from '../services/tmux.js';
 import statusEngine from '../services/status-engine.js';
 import { hasUsers } from '../lib/auth.js';
-import { randomBytes } from 'node:crypto';
+import { DEFAULT_HOST } from '../lib/constants.js';
+import { noStoreResponse } from '../lib/response-headers.js';
+import { assertTerminalSessionName, normalizeTerminalSize } from '../lib/terminal-utils.js';
+import { authorizeWebSocketRequest, createWsTokenStore, isTerminalWsMessageTooLarge, logRejectedWebSocket, parseTerminalWsMessage, terminalExitReason, wsCloseReason } from '../lib/ws-utils.js';
 
-// Short-lived WS auth tokens — valid for 30 seconds
-const wsTokens = new Map();
-
-function generateWsToken(sessionId) {
-  const token = randomBytes(24).toString('hex');
-  wsTokens.set(token, { sessionId, created: Date.now() });
-  // Clean up expired tokens
-  for (const [t, v] of wsTokens) {
-    if (Date.now() - v.created > 30000) wsTokens.delete(t);
-  }
-  return token;
-}
-
-function validateWsToken(token) {
-  const entry = wsTokens.get(token);
-  if (!entry) return false;
-  wsTokens.delete(token); // One-time use
-  return Date.now() - entry.created < 30000;
-}
+const wsTokenStore = createWsTokenStore();
+export const WS_TOKEN_RATE_LIMIT_MAX = 120;
+export const WS_TOKEN_RATE_LIMIT_WINDOW = '1 minute';
 
 export default async function terminalWsRoutes(fastify) {
   // Token endpoint — authenticated users get a short-lived WS token
-  fastify.get('/api/ws-token', async (req, reply) => {
+  fastify.get('/api/ws-token', {
+    config: {
+      rateLimit: {
+        max: WS_TOKEN_RATE_LIMIT_MAX,
+        timeWindow: WS_TOKEN_RATE_LIMIT_WINDOW,
+      },
+    },
+  }, async (req, reply) => {
     // This endpoint goes through normal auth middleware (cookie-based)
-    const token = generateWsToken(req.session?.sessionId || 'anon');
+    noStoreResponse(reply);
+    const token = wsTokenStore.generate(req.session?.sessionId || 'anon');
     return { token };
   });
 
   fastify.get('/ws/terminal', { websocket: true }, (socket, req) => {
-    // Auth check: accept session cookie or valid one-time WS token.
-    if (!hasUsers(fastify.db)) {
-      socket.close(1008, 'Setup required');
-      return;
-    }
-    const isAuthenticated = req.session?.authenticated;
-    const tokenValid = req.query.token ? validateWsToken(req.query.token) : false;
-    if (!isAuthenticated && !tokenValid) {
-      fastify.log.warn({ ip: req.ip, isAuthenticated, tokenValid }, 'WebSocket auth rejected');
-      socket.close(1008, 'Authentication required');
+    const authorization = authorizeWebSocketRequest(req, {
+      db: fastify.db,
+      hasUsers,
+      tokenStore: wsTokenStore,
+      allowToken: true,
+    });
+    if (!authorization.ok) {
+      logRejectedWebSocket(fastify, req, authorization, 'Terminal');
+      socket.close(authorization.code, authorization.reason);
       return;
     }
 
     const session = req.query.session;
-    const host = req.query.host || 'reliant';
+    const host = req.query.host || DEFAULT_HOST;
 
     if (!session) {
       fastify.log.warn('WebSocket connect without session param');
       socket.close(1008, 'Missing session parameter');
       return;
     }
+    try {
+      assertTerminalSessionName(session);
+    } catch (err) {
+      fastify.log.warn({ session, err: err.message }, 'WebSocket connect with invalid session param');
+      socket.close(1008, wsCloseReason(err.message));
+      return;
+    }
 
-    const cols = parseInt(req.query.cols) || 80;
-    const rows = parseInt(req.query.rows) || 24;
+    const { cols, rows } = normalizeTerminalSize(req.query);
 
     fastify.log.info({ session, host, cols, rows }, 'Terminal WebSocket connecting');
 
@@ -68,7 +68,7 @@ export default async function terminalWsRoutes(fastify) {
       terminal = spawnTerminal(session, host, { cols, rows, db: fastify.db });
     } catch (err) {
       fastify.log.error({ err, session, host }, 'Failed to spawn terminal');
-      socket.close(1011, `Failed to spawn: ${err.message}`);
+      socket.close(1011, wsCloseReason(`Failed to spawn: ${err.message}`));
       return;
     }
 
@@ -110,31 +110,32 @@ export default async function terminalWsRoutes(fastify) {
 
     // WebSocket messages → PTY input or control
     socket.on('message', (rawMsg) => {
-      const str = rawMsg.toString();
+      if (isTerminalWsMessageTooLarge(rawMsg)) {
+        fastify.log.warn({ id, session, host }, 'Terminal WebSocket input exceeded message size limit');
+        socket.close(1009, 'Terminal input message is too large');
+        return;
+      }
 
-      // Try parsing as JSON control message
-      if (str.startsWith('{')) {
-        try {
-          const msg = JSON.parse(str);
-          if (msg.type === 'resize' && msg.cols && msg.rows) {
-            resizeTerminal(id, msg.cols, msg.rows);
-            return;
-          }
-          if (msg.type === 'scroll' && Number.isFinite(msg.lines) && msg.lines !== 0) {
-            const targetHost = findHost(fastify.db, host) || { name: host, isLocal: true, connectionType: 'ssh' };
-            scrollSession(targetHost, session, msg.lines).catch((err) => {
-              fastify.log.warn({ err, session, host }, 'Failed to scroll terminal session');
-            });
-            return;
-          }
-        } catch {
-          // Not valid JSON, fall through to terminal input
-        }
+      const msg = parseTerminalWsMessage(rawMsg);
+      if (msg.type === 'resize') {
+        const size = normalizeTerminalSize(msg);
+        resizeTerminal(id, size.cols, size.rows);
+        return;
+      }
+      if (msg.type === 'scroll') {
+        const targetHost = findHost(fastify.db, host) || { name: host, isLocal: true, connectionType: 'ssh' };
+        scrollSession(targetHost, session, msg.lines).catch((err) => {
+          fastify.log.warn({ err, session, host }, 'Failed to scroll terminal session');
+        });
+        return;
+      }
+      if (msg.type === 'noop') {
+        return;
       }
 
       // Raw terminal input
       try {
-        term.write(str);
+        term.write(msg.data);
       } catch {
         // PTY may have closed
       }
@@ -153,43 +154,4 @@ export default async function terminalWsRoutes(fastify) {
       killTerminal(id);
     });
   });
-}
-
-function terminalExitReason({ exitCode, signal, recentOutput, ageMs }) {
-  const output = cleanTerminalOutput(recentOutput);
-  let message = output || `Terminal exited${typeof exitCode === 'number' ? ` with code ${exitCode}` : ''}${signal ? ` (${signal})` : ''}`;
-
-  if (output.includes("can't find session") || output.includes('no such session')) {
-    message = output;
-  } else if (output.includes('no sessions')) {
-    message = 'tmux session does not exist or was deleted';
-  } else if (output.includes('error connecting to /tmp/tmux-') || output.includes('no server running')) {
-    message = 'tmux is not running or the session no longer exists';
-  } else if (output.includes('command not found') || output.includes('not found')) {
-    message = output;
-  } else if (!output && ageMs < 2000) {
-    message = 'Terminal exited immediately';
-  }
-
-  return {
-    code: exitCode === 0 && ageMs >= 2000 ? 1000 : 1011,
-    message: truncateCloseReason(message),
-  };
-}
-
-function cleanTerminalOutput(value) {
-  return String(value || '')
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-    .replace(/\r/g, '')
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean)
-    .slice(-3)
-    .join(' | ')
-    .trim();
-}
-
-function truncateCloseReason(value) {
-  const text = String(value || 'Terminal exited');
-  return text.length > 120 ? `${text.slice(0, 117)}...` : text;
 }

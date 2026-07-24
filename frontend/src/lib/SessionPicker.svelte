@@ -1,5 +1,6 @@
 <script>
   import { translate } from './i18n.js';
+  import { DEFAULT_HOST } from './constants.js';
 
   let {
     language = 'en',
@@ -44,7 +45,7 @@
           >
             <span class="dot" style="background:{typeColor(s.type)};box-shadow:0 0 6px {typeColor(s.type)}"></span>
             <span class="picker-name">{s.name}</span>
-            <span class="picker-host">{s.host || 'reliant'}</span>
+            <span class="picker-host">{s.host || DEFAULT_HOST}</span>
             {#if s.name === currentSession}
               <span class="picker-current">{t('current')}</span>
             {/if}

@@ -1,16 +1,25 @@
-// src/services/tmux.js — tmux session query and type detection
+// src/services/tmux.js - tmux session query and type detection
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { execDockerOnHost, execDockerShellOnHost } from './docker.js';
-import { shellQuote, sshCommand } from './connection.js';
-
-const execFileAsync = promisify(execFile);
+import { mapWithConcurrency } from '../lib/async-utils.js';
+import { shellQuote } from './connection.js';
+import { execHostShell, execTmux } from './host-exec.js';
+import {
+  assertValidSessionName,
+  classifyTmuxError,
+  cleanTmuxError,
+  isTmuxServerNotRunning,
+  normalizeStartDir,
+  tmuxErrorDiagnostics,
+} from './tmux-utils.js';
 
 const SESSION_FORMAT = '#{session_name}|#{session_windows}|#{session_attached}|#{session_created}|#{session_activity}';
 const ACTIVITY_FORMAT = '#{session_name}|#{session_activity}';
 const PANE_FORMAT = '#{pane_current_command}';
 const PANE_PATH_FORMAT = '#{pane_current_path}';
+export const SESSION_ENRICH_CONCURRENCY = 4;
+export const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
+export const CAPTURE_TRUNCATION_NOTICE = `\n[Session Deck: capture truncated at ${MAX_CAPTURE_BYTES} bytes]\n`;
+const CAPTURE_EXEC_MAX_BUFFER = MAX_CAPTURE_BYTES + 256 * 1024;
 
 const TYPE_MAP = {
   claude: 'claude-code',
@@ -63,7 +72,7 @@ export async function listSessions(host, options = {}) {
     }).filter(p => p.name);
 
     // Run type + context detection in parallel for all sessions
-    const enriched = await Promise.all(parsed.map(async (p) => {
+    const enriched = await mapWithConcurrency(parsed, SESSION_ENRICH_CONCURRENCY, async (p) => {
       const [type, context] = await Promise.all([
         detectType(host, p.name, timeout),
         detectContext(host, p.name, timeout),
@@ -79,15 +88,15 @@ export async function listSessions(host, options = {}) {
         workingDir: context.workingDir,
         repoName: context.repoName,
       };
-    }));
+    });
 
     return result(host.name, 'online', enriched, start);
   } catch (err) {
     if (isTmuxServerNotRunning(err)) {
       return result(host.name, 'online', [], start);
     }
-    const status = classifyError(err);
-    return result(host.name, status, [], start, cleanError(err));
+    const status = classifyTmuxError(err);
+    return result(host.name, status, [], start, cleanTmuxError(err), tmuxErrorDiagnostics(err));
   }
 }
 
@@ -195,30 +204,14 @@ async function detectContext(host, sessionName, timeout) {
     ctx.workingDir = panePath;
 
     // Try to detect git repo name
-    if (host.connectionType === 'docker') {
-      try {
-        const gitOut = await execDockerShellOnHost(host, `cd '${shellQuoteInner(panePath)}' && git rev-parse --show-toplevel 2>/dev/null`, timeout);
-        const repoRoot = gitOut.trim();
-        if (repoRoot) {
-          ctx.repoName = repoRoot.split('/').pop();
-        }
-      } catch { /* not a git repo or git not installed */ }
-    } else if (host.isLocal) {
-      try {
-        const { stdout } = await execFileAsync('git', ['-C', panePath, 'rev-parse', '--show-toplevel'], { timeout: 2000 });
-        const repoRoot = stdout.trim();
-        if (repoRoot) {
-          ctx.repoName = repoRoot.split('/').pop();
-        }
-      } catch { /* not a git repo */ }
-    } else {
-      try {
-        const gitOut = await execRemote(host, `cd ${shellQuote(panePath)} && git rev-parse --show-toplevel 2>/dev/null`, timeout);
-        const repoRoot = gitOut.trim();
-        if (repoRoot) {
-          ctx.repoName = repoRoot.split('/').pop();
-        }
-      } catch { /* not a git repo or git not installed */ }
+    try {
+      const gitOut = await execHostShell(host, gitRepoRootCommand(panePath), timeout);
+      const repoRoot = gitOut.trim();
+      if (repoRoot) {
+        ctx.repoName = repoRoot.split('/').pop();
+      }
+    } catch {
+      // not a git repo or git is unavailable
     }
 
     // If no git repo, use the directory name as a fallback context
@@ -229,71 +222,11 @@ async function detectContext(host, sessionName, timeout) {
   return ctx;
 }
 
-async function execLocal(args, timeout) {
-  const { stdout } = await execFileAsync('tmux', args, { timeout });
-  return stdout;
+export function gitRepoRootCommand(path) {
+  return `cd ${shellQuote(path)} && git rev-parse --show-toplevel 2>/dev/null`;
 }
 
-async function execTmux(host, args, timeout) {
-  if (host.connectionType === 'docker') {
-    return execDockerOnHost(host, ['tmux', ...args], timeout);
-  }
-  if (host.isLocal) return execLocal(args, timeout);
-  return execRemote(host, `tmux ${args.map(shellQuote).join(' ')}`, timeout);
-}
-
-async function execRemote(host, command, timeout) {
-  const cmd = sshCommand(host, command, { timeoutMs: timeout });
-  const { stdout } = await execFileAsync(cmd.command, cmd.args, { timeout: timeout + 2000 });
-  return stdout;
-}
-
-function classifyError(err) {
-  const msg = (err.message || '') + (err.stderr || '');
-  if (msg.includes('ETIMEDOUT') || msg.includes('timed out') || msg.includes('Connection timed out')) {
-    return 'unreachable';
-  }
-  if (msg.includes('Connection refused') || msg.includes('No route to host')) {
-    return 'unreachable';
-  }
-  if (msg.includes('command not found') || msg.includes('spawn tmux ENOENT')) {
-    return 'no-tmux';
-  }
-  if (msg.includes('Permission denied')) {
-    return 'auth-failed';
-  }
-  return 'error';
-}
-
-function isTmuxServerNotRunning(err) {
-  const msg = (err.message || '') + (err.stderr || '');
-  return msg.includes('no server running') ||
-    msg.includes('no current client') ||
-    msg.includes('error connecting to /tmp/tmux-') ||
-    msg.includes('failed to connect to server');
-}
-
-function shellQuoteInner(value) {
-  return String(value).replace(/'/g, "'\\''");
-}
-
-/** Produce a clean user-facing error from a raw SSH/tmux error. */
-function cleanError(err) {
-  const msg = (err.message || '') + (err.stderr || '');
-  if (msg.includes('command not found') || msg.includes('spawn tmux ENOENT')) return 'tmux is not installed on this host';
-  if (isTmuxServerNotRunning(err)) return 'tmux is not running on this host';
-  if (msg.includes('ETIMEDOUT') || msg.includes('timed out') || msg.includes('Connection timed out')) return 'host is unreachable (connection timed out)';
-  if (msg.includes('Connection refused')) return 'connection refused';
-  if (msg.includes('No route to host')) return 'host is unreachable (no route)';
-  if (msg.includes('Permission denied')) return 'SSH authentication failed';
-  if (msg.includes('duplicate session')) return 'session already exists';
-  if (msg.includes('no such session') || msg.includes("can't find session")) return 'session not found';
-  // Strip "Command failed: ssh ..." prefix if present
-  const clean = (err.stderr || err.message || 'unknown error').replace(/^Command failed:.*?\n?/, '').trim();
-  return clean || 'unknown error';
-}
-
-function result(hostName, status, sessions, startMs, error) {
+function result(hostName, status, sessions, startMs, error, diagnostics = {}) {
   return {
     host: hostName,
     status,
@@ -301,27 +234,11 @@ function result(hostName, status, sessions, startMs, error) {
     sessionCount: sessions.length,
     queryMs: Date.now() - startMs,
     ...(error ? { error } : {}),
+    ...diagnostics,
   };
 }
 
 // --- Session mutation operations ---
-
-const SESSION_NAME_RE = /^[a-zA-Z0-9_-]+$/;
-
-function validateSessionName(name) {
-  if (!name || typeof name !== 'string') {
-    throw Object.assign(new Error('Session name is required'), { statusCode: 400 });
-  }
-  if (!SESSION_NAME_RE.test(name)) {
-    throw Object.assign(
-      new Error(`Invalid session name: "${name}". Use only letters, numbers, hyphens, underscores.`),
-      { statusCode: 400 }
-    );
-  }
-  if (name.length > 64) {
-    throw Object.assign(new Error('Session name must be 64 characters or fewer'), { statusCode: 400 });
-  }
-}
 
 /**
  * Create a new tmux session on a host.
@@ -331,26 +248,20 @@ function validateSessionName(name) {
  * @returns {Promise<{success: boolean, host: string, session: string}>}
  */
 export async function createSession(host, name, startDir) {
-  validateSessionName(name);
+  assertValidSessionName(name);
+  const normalizedStartDir = normalizeStartDir(startDir);
 
   const args = ['new-session', '-d', '-s', name];
-  if (startDir) args.push('-c', startDir);
+  if (normalizedStartDir) args.push('-c', normalizedStartDir);
 
   try {
-    if (host.connectionType === 'docker') {
-      await execDockerOnHost(host, ['tmux', ...args], 5000);
-    } else if (host.isLocal) {
-      await execLocal(args, 5000);
-    } else {
-      const cmd = `tmux new-session -d -s ${shellQuote(name)}${startDir ? ` -c ${shellQuote(startDir)}` : ''}`;
-      await execRemote(host, cmd, 5000);
-    }
+    await execTmux(host, args, 5000);
     return { success: true, host: host.name, session: name };
   } catch (err) {
     if (err.stderr?.includes('duplicate session') || err.message?.includes('duplicate session')) {
       throw Object.assign(new Error(`Session "${name}" already exists on ${host.name}`), { statusCode: 409 });
     }
-    throw Object.assign(new Error(`Failed to create session on ${host.name}: ${cleanError(err)}`), { statusCode: 500 });
+    throw Object.assign(new Error(`Failed to create session on ${host.name}: ${cleanTmuxError(err)}`), { statusCode: 500 });
   }
 }
 
@@ -362,22 +273,17 @@ export async function createSession(host, name, startDir) {
  * @returns {Promise<{success: boolean, host: string, oldName: string, newName: string}>}
  */
 export async function renameSession(host, oldName, newName) {
-  validateSessionName(newName);
+  assertValidSessionName(oldName);
+  assertValidSessionName(newName);
 
   try {
-    if (host.connectionType === 'docker') {
-      await execDockerOnHost(host, ['tmux', 'rename-session', '-t', oldName, newName], 5000);
-    } else if (host.isLocal) {
-      await execLocal(['rename-session', '-t', oldName, newName], 5000);
-    } else {
-      await execRemote(host, `tmux rename-session -t ${shellQuote(oldName)} ${shellQuote(newName)}`, 5000);
-    }
+    await execTmux(host, ['rename-session', '-t', oldName, newName], 5000);
     return { success: true, host: host.name, oldName, newName };
   } catch (err) {
     if (err.stderr?.includes('no such session') || err.message?.includes("can't find session")) {
       throw Object.assign(new Error(`Session "${oldName}" not found on ${host.name}`), { statusCode: 404 });
     }
-    throw Object.assign(new Error(`Failed to rename session on ${host.name}: ${cleanError(err)}`), { statusCode: 500 });
+    throw Object.assign(new Error(`Failed to rename session on ${host.name}: ${cleanTmuxError(err)}`), { statusCode: 500 });
   }
 }
 
@@ -388,20 +294,16 @@ export async function renameSession(host, oldName, newName) {
  * @returns {Promise<{success: boolean, host: string, session: string}>}
  */
 export async function deleteSession(host, name) {
+  assertValidSessionName(name);
+
   try {
-    if (host.connectionType === 'docker') {
-      await execDockerOnHost(host, ['tmux', 'kill-session', '-t', name], 5000);
-    } else if (host.isLocal) {
-      await execLocal(['kill-session', '-t', name], 5000);
-    } else {
-      await execRemote(host, `tmux kill-session -t ${shellQuote(name)}`, 5000);
-    }
+    await execTmux(host, ['kill-session', '-t', name], 5000);
     return { success: true, host: host.name, session: name };
   } catch (err) {
     if (err.stderr?.includes('no such session') || err.message?.includes("can't find session")) {
       throw Object.assign(new Error(`Session "${name}" not found on ${host.name}`), { statusCode: 404 });
     }
-    throw Object.assign(new Error(`Failed to delete session on ${host.name}: ${cleanError(err)}`), { statusCode: 500 });
+    throw Object.assign(new Error(`Failed to delete session on ${host.name}: ${cleanTmuxError(err)}`), { statusCode: 500 });
   }
 }
 
@@ -412,22 +314,26 @@ export async function deleteSession(host, name) {
  * @param {number} lines Positive scrolls down, negative scrolls up.
  */
 export async function scrollSession(host, sessionName, lines) {
+  assertValidSessionName(sessionName);
+
   const count = Math.max(1, Math.min(200, Math.abs(parseInt(lines, 10) || 1)));
   const direction = lines > 0 ? 'scroll-down' : 'scroll-up';
   const timeout = 2000;
 
-  if (host.connectionType === 'docker') {
-    await execDockerOnHost(host, ['tmux', 'copy-mode', '-e', '-t', sessionName], timeout);
-    await execDockerOnHost(host, ['tmux', 'send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
-  } else if (host.isLocal) {
-    await execLocal(['copy-mode', '-e', '-t', sessionName], timeout);
-    await execLocal(['send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
-  } else {
-    await execRemote(
-      host,
-      `tmux copy-mode -e -t ${shellQuote(sessionName)} \\; send-keys -t ${shellQuote(sessionName)} -X -N ${count} ${direction}`,
-      timeout
-    );
+  await execTmux(host, ['copy-mode', '-e', '-t', sessionName], timeout);
+  await execTmux(host, ['send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
+}
+
+export async function sendLinesToSession(host, sessionName, lines, options = {}) {
+  assertValidSessionName(sessionName);
+  const delayMs = Number.isFinite(options.delayMs) ? Math.max(0, options.delayMs) : 50;
+  const timeout = options.timeout || 5000;
+
+  for (const line of lines || []) {
+    await execTmux(host, ['send-keys', '-t', sessionName, String(line), 'Enter'], timeout);
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
   }
 }
 
@@ -439,28 +345,16 @@ export async function scrollSession(host, sessionName, lines) {
  * @returns {Promise<string>}
  */
 export async function captureSession(host, sessionName) {
+  assertValidSessionName(sessionName);
+
   const timeout = 10000;
   try {
     // List all window.pane indices in the session
-    let paneList;
-    if (host.connectionType === 'docker') {
-      paneList = await execDockerOnHost(
-        host,
-        ['tmux', 'list-panes', '-t', sessionName, '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
-        timeout
-      );
-    } else if (host.isLocal) {
-      paneList = await execLocal(
-        ['list-panes', '-t', sessionName, '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
-        timeout
-      );
-    } else {
-      paneList = await execRemote(
-        host,
-        `tmux list-panes -t ${shellQuote(sessionName)} -a -F '#{session_name}:#{window_index}.#{pane_index}'`,
-        timeout
-      );
-    }
+    const paneList = await execTmux(
+      host,
+      ['list-panes', '-t', sessionName, '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
+      timeout
+    );
 
     // Filter to only panes belonging to this session (the -a flag lists all)
     const panes = paneList.trim().split('\n').filter(p => p.startsWith(sessionName + ':'));
@@ -477,38 +371,49 @@ export async function captureSession(host, sessionName) {
       }
 
       try {
-        let output;
-        if (host.connectionType === 'docker') {
-          output = await execDockerOnHost(
-            host,
-            ['tmux', 'capture-pane', '-t', paneTarget, '-p', '-S', '-'],
-            timeout
-          );
-        } else if (host.isLocal) {
-          output = await execLocal(['capture-pane', '-t', paneTarget, '-p', '-S', '-'], timeout);
-        } else {
-          output = await execRemote(
-            host,
-            `tmux capture-pane -t ${shellQuote(paneTarget)} -p -S -`,
-            timeout
-          );
-        }
+        const output = await execTmux(host, ['capture-pane', '-t', paneTarget, '-p', '-S', '-'], timeout, {
+          maxBuffer: CAPTURE_EXEC_MAX_BUFFER,
+        });
         chunks.push(output);
+        if (captureTextByteLength(chunks) > MAX_CAPTURE_BYTES) break;
       } catch (paneErr) {
         chunks.push(`[Error capturing pane: ${paneErr.message}]\n`);
       }
     }
 
-    return chunks.join('');
+    return truncateCaptureText(chunks.join(''));
   } catch (err) {
     if (err.statusCode) throw err;
-    const kind = classifyError(err);
+    const kind = classifyTmuxError(err);
     if (kind === 'unreachable') {
       throw Object.assign(new Error(`Host ${host.name} is unreachable`), { statusCode: 503 });
     }
     if (kind === 'no-tmux') {
       throw Object.assign(new Error(`tmux not running on ${host.name}`), { statusCode: 503 });
     }
-    throw Object.assign(new Error(`Failed to capture session on ${host.name}: ${cleanError(err)}`), { statusCode: 500 });
+    throw Object.assign(new Error(`Failed to capture session on ${host.name}: ${cleanTmuxError(err)}`), { statusCode: 500 });
   }
+}
+
+export function truncateCaptureText(text, maxBytes = MAX_CAPTURE_BYTES) {
+  if (Buffer.byteLength(text) <= maxBytes) return text;
+  const noticeBytes = Buffer.byteLength(CAPTURE_TRUNCATION_NOTICE);
+  const contentLimit = Math.max(0, maxBytes - noticeBytes);
+  return `${utf8Prefix(text, contentLimit)}${CAPTURE_TRUNCATION_NOTICE}`;
+}
+
+function captureTextByteLength(chunks) {
+  return chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk), 0);
+}
+
+function utf8Prefix(value, maxBytes) {
+  let bytes = 0;
+  let output = '';
+  for (const char of String(value)) {
+    const nextBytes = Buffer.byteLength(char);
+    if (bytes + nextBytes > maxBytes) break;
+    output += char;
+    bytes += nextBytes;
+  }
+  return output;
 }

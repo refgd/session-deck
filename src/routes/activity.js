@@ -4,34 +4,41 @@
 
 import { listAllActivity } from '../services/tmux.js';
 import { getSessionHosts } from '../services/hosts.js';
+import { apiError } from '../lib/api-error.js';
+import { noStoreResponse } from '../lib/response-headers.js';
 
 export default async function activityRoutes(fastify) {
   const db = fastify.db;
 
   // GET /api/activity — returns { host, session, lastActivity } for all sessions
-  fastify.get('/api/activity', async () => {
-    const hosts = getSessionHosts(db);
+  fastify.get('/api/activity', async (_request, reply) => {
+    noStoreResponse(reply);
+    try {
+      const hosts = getSessionHosts(db);
 
-    // Filter to tmux-capable hosts
-    const tmuxHosts = hosts.filter(h => {
-      const skip = ['Network', 'Client'];
-      return !skip.includes(h.group);
-    });
+      // Filter to tmux-capable hosts
+      const tmuxHosts = hosts.filter(h => {
+        const skip = ['Network', 'Client'];
+        return !skip.includes(h.group);
+      });
 
-    const results = await listAllActivity(tmuxHosts, { timeout: 3000 });
+      const results = await listAllActivity(tmuxHosts, { timeout: 3000 });
 
-    // Flatten into a simple array: { host, session, lastActivity }
-    const activity = [];
-    for (const hostResult of results) {
-      for (const s of hostResult.sessions) {
-        activity.push({
-          host: hostResult.host,
-          session: s.name,
-          lastActivity: s.lastActivity,
-        });
+      // Flatten into a simple array: { host, session, lastActivity }
+      const activity = [];
+      for (const hostResult of results) {
+        for (const s of hostResult.sessions) {
+          activity.push({
+            host: hostResult.host,
+            session: s.name,
+            lastActivity: s.lastActivity,
+          });
+        }
       }
-    }
 
-    return { activity };
+      return { activity };
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500);
+    }
   });
 }

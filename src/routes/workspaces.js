@@ -1,99 +1,168 @@
 // src/routes/workspaces.js — Workspace CRUD API with SQLite persistence
 
+import { apiError } from '../lib/api-error.js';
+import { recordAuditEvent } from '../lib/audit-log.js';
+import { countLayoutPanes } from '../lib/layout-utils.js';
+import { normalizeResourceDescription, normalizeResourceName } from '../lib/name-description-limits.js';
+import { parsePositiveRouteId } from '../lib/route-params.js';
+import { noStoreResponse } from '../lib/response-headers.js';
+import {
+  createWorkspaceRow,
+  deleteWorkspaceRow,
+  getWorkspaceRow,
+  listWorkspaceRows,
+  removeLegacyDefaultLayoutPresets,
+  serializeWorkspace,
+  updateWorkspaceRow,
+} from '../lib/workspace-store.js';
+
 export default async function workspaceRoutes(fastify) {
   const db = fastify.db;
 
   // Older builds seeded example workspaces on first run. Remove only those
   // generated defaults so new installs start empty and show the setup flow.
-  removeLegacyDefaults(db);
+  removeLegacyDefaultLayoutPresets(db);
 
   // List all workspaces
-  fastify.get('/api/workspaces', async () => {
-    const rows = db.prepare('SELECT * FROM layout_presets ORDER BY sort_order, id').all();
-    return {
-      workspaces: rows.map(r => ({
-        id: r.id,
-        name: r.name,
-        description: r.description,
-        layout: JSON.parse(r.layout_json),
-        isDefault: !!r.is_default,
-        sortOrder: r.sort_order || 0,
-      })),
-    };
+  fastify.get('/api/workspaces', async (_request, reply) => {
+    noStoreResponse(reply);
+    try {
+      return {
+        workspaces: listWorkspaceRows(db).map(row => serializeWorkspace(row, { includeSortOrder: true })),
+      };
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500);
+    }
   });
 
   // Get single workspace
   fastify.get('/api/workspaces/:id', async (request, reply) => {
-    const row = db.prepare('SELECT * FROM layout_presets WHERE id = ?').get(request.params.id);
-    if (!row) return reply.code(404).send({ error: 'Workspace not found' });
-    return {
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      layout: JSON.parse(row.layout_json),
-      isDefault: !!row.is_default,
-    };
+    noStoreResponse(reply);
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      const row = getWorkspaceRow(db, id);
+      if (!row) return apiError(reply, 'Workspace not found', 404, { id });
+      return serializeWorkspace(row);
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
+    }
   });
 
   // Create workspace
   fastify.post('/api/workspaces', async (request, reply) => {
     const { name, layout, description } = request.body || {};
-    if (!name) return reply.code(400).send({ error: 'Name is required' });
-    if (!layout) return reply.code(400).send({ error: 'Layout is required' });
+    const normalizedName = normalizeResourceName(name, { required: true });
+    if (normalizedName.error) return apiError(reply, normalizedName.error, 400);
+    const normalizedDescription = normalizeResourceDescription(description, { defaultValue: '' });
+    if (normalizedDescription.error) return apiError(reply, normalizedDescription.error, 400);
+    if (!layout) return apiError(reply, 'Layout is required', 400);
 
     try {
-      const result = db.prepare(
-        'INSERT INTO layout_presets (name, description, layout_json) VALUES (?, ?, ?)'
-      ).run(name, description || '', JSON.stringify(layout));
+      const row = createWorkspaceRow(db, { name: normalizedName.value, description: normalizedDescription.value, layout });
 
-      fastify.log.info({ id: result.lastInsertRowid, name }, 'Workspace created');
+      fastify.log.info({ id: row.id, name: normalizedName.value }, 'Workspace created');
+      recordAuditEvent(db, {
+        request,
+        action: 'workspace.create',
+        targetType: 'workspace',
+        targetId: row.id,
+        targetName: normalizedName.value,
+        details: { paneCount: countLayoutPanes(layout) },
+      });
       return reply.code(201).send({
-        id: result.lastInsertRowid,
-        name,
+        id: row.id,
+        name: normalizedName.value,
         layout,
       });
     } catch (err) {
-      if (err.message.includes('UNIQUE')) {
-        return reply.code(409).send({ error: `Workspace "${name}" already exists` });
+      recordAuditEvent(db, {
+        request,
+        action: 'workspace.create',
+        targetType: 'workspace',
+        targetName: normalizedName.value,
+        status: 'error',
+        error: err.message,
+      });
+      if (err.statusCode) return apiError(reply, err, err.statusCode);
+      if (err.message?.includes('UNIQUE')) {
+        return apiError(reply, `Workspace "${normalizedName.value}" already exists`, 409, { name: normalizedName.value });
       }
-      throw err;
+      return apiError(reply, err, 500, { name: normalizedName.value });
     }
   });
 
   // Update workspace layout
   fastify.put('/api/workspaces/:id', async (request, reply) => {
     const { layout, name, description } = request.body || {};
-    const row = db.prepare('SELECT * FROM layout_presets WHERE id = ?').get(request.params.id);
-    if (!row) return reply.code(404).send({ error: 'Workspace not found' });
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      const row = getWorkspaceRow(db, id);
+      if (!row) return apiError(reply, 'Workspace not found', 404, { id });
 
-    const updates = [];
-    const params = [];
-    if (layout) { updates.push('layout_json = ?'); params.push(JSON.stringify(layout)); }
-    if (name) { updates.push('name = ?'); params.push(name); }
-    if (description !== undefined) { updates.push('description = ?'); params.push(description); }
-    updates.push("updated_at = datetime('now')");
-    params.push(request.params.id);
-
-    db.prepare(`UPDATE layout_presets SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-    fastify.log.info({ id: request.params.id }, 'Workspace updated');
-    return { success: true, id: Number(request.params.id) };
+      const updates = { layout };
+      if (name !== undefined) {
+        const normalizedName = normalizeResourceName(name, { required: true });
+        if (normalizedName.error) return apiError(reply, normalizedName.error, 400);
+        updates.name = normalizedName.value;
+      }
+      if (description !== undefined) {
+        const normalizedDescription = normalizeResourceDescription(description);
+        if (normalizedDescription.error) return apiError(reply, normalizedDescription.error, 400);
+        updates.description = normalizedDescription.value;
+      }
+      const changed = updateWorkspaceRow(db, id, updates);
+      if (!changed) return apiError(reply, 'Nothing to update', 400, { id });
+      fastify.log.info({ id }, 'Workspace updated');
+      recordAuditEvent(db, {
+        request,
+        action: 'workspace.update',
+        targetType: 'workspace',
+        targetId: id,
+        targetName: updates.name || row.name,
+        details: {
+          renamed: updates.name !== undefined && updates.name !== row.name,
+          descriptionChanged: updates.description !== undefined,
+          layoutChanged: layout !== undefined,
+          paneCount: layout ? countLayoutPanes(layout) : countLayoutPanes(JSON.parse(row.layout_json)),
+        },
+      });
+      return { success: true, id };
+    } catch (err) {
+      recordAuditEvent(db, {
+        request,
+        action: 'workspace.update',
+        targetType: 'workspace',
+        targetId: Number.isFinite(Number(id)) ? id : null,
+        status: 'error',
+        error: err.message,
+      });
+      if (err.statusCode) return apiError(reply, err, err.statusCode);
+      return apiError(reply, err, 500, { id: err.id ?? id });
+    }
   });
 
   // Delete workspace
   fastify.delete('/api/workspaces/:id', async (request, reply) => {
-    const row = db.prepare('SELECT * FROM layout_presets WHERE id = ?').get(request.params.id);
-    if (!row) return reply.code(404).send({ error: 'Workspace not found' });
+    let row = null;
+    let id = request.params.id;
+    try {
+      id = parsePositiveRouteId(request.params.id);
+      row = deleteWorkspaceRow(db, id);
+      if (!row) return apiError(reply, 'Workspace not found', 404, { id });
+    } catch (err) {
+      return apiError(reply, err, err.statusCode || 500, { id: err.id ?? id });
+    }
 
-    db.prepare('DELETE FROM layout_presets WHERE id = ?').run(request.params.id);
-    fastify.log.info({ id: request.params.id, name: row.name }, 'Workspace deleted');
+    fastify.log.info({ id, name: row.name }, 'Workspace deleted');
+    recordAuditEvent(db, {
+      request,
+      action: 'workspace.delete',
+      targetType: 'workspace',
+      targetId: row.id,
+      targetName: row.name,
+    });
     return { success: true };
   });
-}
-
-function removeLegacyDefaults(db) {
-  db.prepare(`
-    DELETE FROM layout_presets
-    WHERE is_default = 1
-      AND name IN ('claude-focus', 'quad', 'deck')
-  `).run();
 }

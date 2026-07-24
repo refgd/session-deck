@@ -4,37 +4,88 @@ import { dockerExecCommand, shellJoin, sshBaseArgs, sshTarget } from './connecti
 
 const execFileAsync = promisify(execFile);
 
-export async function listRunningContainers(gatewayHost = null) {
-  const dockerPs = ['docker', 'ps', '--format', '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}'];
-  let stdout;
+const DOCKER_PS_FORMAT = '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}';
+export const MAX_DOCKER_CONTAINERS = 500;
+
+export function dockerListCommand(gatewayHost = null) {
+  const dockerPs = ['docker', 'ps', '--format', DOCKER_PS_FORMAT];
 
   if (gatewayHost?.connectionType === 'ssh') {
-    const result = await execFileAsync(
-      'ssh',
-      [...sshBaseArgs(gatewayHost, { timeoutMs: 5000 }), sshTarget(gatewayHost), shellJoin(dockerPs)],
-      { timeout: 7000 }
-    );
-    stdout = result.stdout;
-  } else if (gatewayHost?.connectionType === 'docker') {
-    const result = await execFileAsync(
-      'docker',
-      ['exec', gatewayHost.dockerContainer || gatewayHost.hostname, ...dockerPs],
-      { timeout: 7000 }
-    );
-    stdout = result.stdout;
-  } else {
-    const result = await execFileAsync(
-      'docker',
-      ['ps', '--format', '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}'],
-      { timeout: 5000 }
-    );
-    stdout = result.stdout;
+    return {
+      command: 'ssh',
+      args: [...sshBaseArgs(gatewayHost, { timeoutMs: 5000 }), sshTarget(gatewayHost), shellJoin(dockerPs)],
+    };
   }
 
-  return stdout.trim().split('\n').filter(Boolean).map(line => {
+  if (gatewayHost?.connectionType === 'docker') {
+    return {
+      command: 'docker',
+      args: ['exec', gatewayHost.dockerContainer || gatewayHost.hostname, ...dockerPs],
+    };
+  }
+
+  return {
+    command: 'docker',
+    args: ['ps', '--format', DOCKER_PS_FORMAT],
+  };
+}
+
+export function dockerListContext(gatewayHost = null) {
+  if (gatewayHost?.connectionType === 'ssh') {
+    return {
+      scope: 'gateway',
+      gatewayType: 'ssh',
+      gatewayName: gatewayHost.name || gatewayHost.hostname,
+      gatewayTarget: sshTarget(gatewayHost),
+      operation: 'docker ps',
+    };
+  }
+
+  if (gatewayHost?.connectionType === 'docker') {
+    return {
+      scope: 'gateway',
+      gatewayType: 'docker',
+      gatewayName: gatewayHost.name || gatewayHost.dockerContainer || gatewayHost.hostname,
+      gatewayContainer: gatewayHost.dockerContainer || gatewayHost.hostname,
+      operation: 'docker ps',
+    };
+  }
+
+  return {
+    scope: 'local',
+    operation: 'docker ps',
+  };
+}
+
+export async function listRunningContainers(gatewayHost = null) {
+  const cmd = dockerListCommand(gatewayHost);
+  const { stdout } = await execFileAsync(cmd.command, cmd.args, { timeout: gatewayHost ? 7000 : 5000 });
+
+  return parseDockerPsOutput(stdout);
+}
+
+export async function listRunningContainersWithContext(gatewayHost = null) {
+  return {
+    containers: await listRunningContainers(gatewayHost),
+    context: dockerListContext(gatewayHost),
+  };
+}
+
+export function parseDockerPsOutput(stdout, maxContainers = MAX_DOCKER_CONTAINERS) {
+  const limit = Number.isFinite(maxContainers) && maxContainers > 0
+    ? Math.floor(maxContainers)
+    : MAX_DOCKER_CONTAINERS;
+  const containers = [];
+
+  for (const line of String(stdout || '').trim().split('\n')) {
+    if (!line.trim()) continue;
     const [id, name, image, status] = line.split('\t');
-    return { id, name, image, status };
-  });
+    if (!id || !name) continue;
+    containers.push({ id, name, image: image || '', status: status || '' });
+    if (containers.length >= limit) break;
+  }
+
+  return containers;
 }
 
 export async function execDocker(container, args, timeout = 5000) {
@@ -43,8 +94,12 @@ export async function execDocker(container, args, timeout = 5000) {
 }
 
 export async function execDockerOnHost(host, args, timeout = 5000, options = {}) {
-  const cmd = dockerExecCommand(host, args, options);
-  const { stdout } = await execFileAsync(cmd.command, cmd.args, { timeout });
+  const { maxBuffer, ...commandOptions } = options;
+  const cmd = dockerExecCommand(host, args, commandOptions);
+  const { stdout } = await execFileAsync(cmd.command, cmd.args, {
+    timeout,
+    ...(maxBuffer ? { maxBuffer } : {}),
+  });
   return stdout;
 }
 

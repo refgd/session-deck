@@ -4,6 +4,8 @@
 // host:session → status. Components subscribe to get notified of changes.
 // Also fires browser notifications when a background pane transitions to "asking".
 
+import { paneSessionKey } from '../pane-key-utils.js';
+
 let _ws = null;
 let _reconnectTimer = null;
 let _listeners = [];
@@ -39,7 +41,8 @@ export function subscribeStatus(fn) {
  * @returns {{ status: string, prevStatus: string, confidence: number, lastTransition: number } | null}
  */
 export function getPaneStatus(host, session) {
-  return _paneStatus[`${host}:${session}`] || null;
+  const key = paneSessionKey(host, session);
+  return key ? _paneStatus[key] || null : null;
 }
 
 /**
@@ -48,7 +51,7 @@ export function getPaneStatus(host, session) {
  * @param {Array<{host: string, session: string}>} panes
  */
 export function setViewingPanes(panes) {
-  _viewingKeys = new Set(panes.map(p => `${p.host || 'reliant'}:${p.session}`));
+  _viewingKeys = new Set(panes.map(p => paneSessionKey(p.host, p.session)).filter(Boolean));
 }
 
 /**
@@ -77,9 +80,10 @@ export function startStatusConnection() {
   const wsUrl = `${proto}//${window.location.host}/ws/status`;
 
   _ws = new WebSocket(wsUrl);
+  const currentSocket = _ws;
 
   _ws.onopen = () => {
-    clearTimeout(_reconnectTimer);
+    clearReconnectTimer();
   };
 
   _ws.onmessage = (evt) => {
@@ -89,7 +93,8 @@ export function startStatusConnection() {
         // Full snapshot — rebuild map
         _paneStatus = {};
         for (const pane of msg.panes) {
-          const key = `${pane.host}:${pane.session}`;
+          const key = paneSessionKey(pane.host, pane.session);
+          if (!key) continue;
           _paneStatus[key] = {
             status: pane.status,
             prevStatus: pane.prevStatus,
@@ -100,7 +105,8 @@ export function startStatusConnection() {
         notify();
       } else if (msg.type === 'status') {
         // Single transition
-        const key = `${msg.host}:${msg.session}`;
+        const key = paneSessionKey(msg.host, msg.session);
+        if (!key) return;
         const prev = _paneStatus[key];
         _paneStatus[key] = {
           status: msg.status,
@@ -121,6 +127,7 @@ export function startStatusConnection() {
   };
 
   _ws.onclose = () => {
+    if (_ws === currentSocket) _ws = null;
     scheduleReconnect();
   };
 
@@ -133,7 +140,7 @@ export function startStatusConnection() {
  * Disconnect status WebSocket. Call on app teardown.
  */
 export function stopStatusConnection() {
-  clearTimeout(_reconnectTimer);
+  clearReconnectTimer();
   if (_ws) {
     _ws.onclose = null; // prevent reconnect
     _ws.close();
@@ -144,10 +151,17 @@ export function stopStatusConnection() {
 // --- Internal ---
 
 function scheduleReconnect() {
-  clearTimeout(_reconnectTimer);
+  clearReconnectTimer();
   _reconnectTimer = setTimeout(() => {
+    _reconnectTimer = null;
     startStatusConnection();
   }, 5000);
+}
+
+function clearReconnectTimer() {
+  if (!_reconnectTimer) return;
+  clearTimeout(_reconnectTimer);
+  _reconnectTimer = null;
 }
 
 function fireNotification(session, host) {
@@ -183,7 +197,8 @@ export function getWorstStatus(panes, statusSnapshot) {
   let worstPriority = -1;
 
   for (const { host, session } of panes) {
-    const key = `${host || 'reliant'}:${session}`;
+    const key = paneSessionKey(host, session);
+    if (!key) continue;
     const entry = source[key];
     if (!entry) continue;
     const p = priority[entry.status] ?? 0;
