@@ -27,7 +27,7 @@ Session Deck gives you a browser-based dashboard for your tmux sessions. Each pa
 - 🖥️ Live terminal panes via xterm.js connected to tmux sessions over WebSocket
 - 📐 Split-tree workspace layouts with drag-to-resize borders
 - 🔀 Drag-and-drop pane rearrangement (swap or directional split)
-- 🗂️ Multiple workspaces with 6 built-in presets (or build your own)
+- 🗂️ Multiple workspaces with split panes you can build up as needed
 - 🌐 Multi-host support — manage tmux on any SSH-accessible machine
 - 🔔 Activity notifications — pulsing badge when background workspaces have new output
 - 🔍 SSH connectivity testing with tmux detection and setup guidance
@@ -89,71 +89,32 @@ Backend runs on `:7890`, frontend dev server on `:5173` with API proxy.
 | `SESSION_DECK_HOST` | `0.0.0.0` | Bind address |
 | `SESSION_DECK_LOG_LEVEL` | `info` | Log level (fatal/error/warn/info/debug/trace) |
 | `SESSION_DECK_DB_PATH` | `./data/session-deck.db` | SQLite database path |
-| `SESSION_DECK_AUTH` | `none` | Auth method: `none`, `basic`, or `oidc` |
-| `SESSION_DECK_AUTH_USER` | — | Username (basic auth) |
-| `SESSION_DECK_AUTH_PASS` | — | Password (basic auth) |
-| `SESSION_DECK_OIDC_ISSUER` | — | OIDC issuer URL (e.g. Entra, Authentik) |
-| `SESSION_DECK_OIDC_CLIENT_ID` | — | OIDC client ID |
-| `SESSION_DECK_OIDC_CLIENT_SECRET` | — | OIDC client secret |
-| `SESSION_DECK_OIDC_REDIRECT_URI` | — | OIDC callback URL |
-| `SESSION_DECK_OIDC_SCOPES` | `openid profile email` | OIDC scopes |
-| `SESSION_DECK_TRUSTED_NETWORKS` | — | CIDRs to bypass auth (e.g. `192.168.0.0/16`) |
-| `SESSION_DECK_SESSION_SECRET` | — | Session cookie secret (set in production!) |
+| `SESSION_DECK_AUTH_USER` | — | Optional first-run admin username |
+| `SESSION_DECK_AUTH_PASS` | — | Optional first-run admin password |
+| `SESSION_DECK_SESSION_SECRET` | Auto-generated in `data/session-secret` | Session cookie secret; set explicitly for managed production deployments |
 | `SESSION_DECK_SESSION_MAX_AGE` | `86400` | Session cookie max age in seconds |
 
 ### Authentication
 
-Session Deck supports three auth modes:
+Session Deck uses local account/password authentication by default.
 
-#### No Auth (default)
-```bash
-SESSION_DECK_AUTH=none  # or just don't set it
-```
+On first launch, if no account exists, the browser opens a setup page where you create the first administrator account.
+For unattended deployments, set the initial account through environment variables:
 
-#### Basic Auth
 ```bash
-SESSION_DECK_AUTH=basic
 SESSION_DECK_AUTH_USER=admin
 SESSION_DECK_AUTH_PASS=your-secure-password
 SESSION_DECK_SESSION_SECRET=random-32-char-string
 ```
 
-#### OpenID Connect (Entra ID, Authentik, Keycloak, etc.)
+If `SESSION_DECK_SESSION_SECRET` is omitted, Session Deck generates a random persistent secret in the data directory. Keep `data/session-secret` private and backed up with the database; changing it signs out existing browser sessions.
 
-**Microsoft Entra ID example:**
+### Security Notes
 
-1. In Azure Portal → App registrations → New registration
-2. Set redirect URI to `https://your-host/auth/callback` (Web platform)
-3. Create a client secret under Certificates & Secrets
-4. Note your tenant ID from the Overview page
-
-```bash
-SESSION_DECK_AUTH=oidc
-SESSION_DECK_OIDC_ISSUER=https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0
-SESSION_DECK_OIDC_CLIENT_ID=your-client-id
-SESSION_DECK_OIDC_CLIENT_SECRET=your-client-secret
-SESSION_DECK_OIDC_REDIRECT_URI=https://deck.hha.sh/auth/callback
-SESSION_DECK_SESSION_SECRET=random-32-char-string
-```
-
-**Authentik / Keycloak example:**
-```bash
-SESSION_DECK_AUTH=oidc
-SESSION_DECK_OIDC_ISSUER=https://auth.example.com/application/o/session-deck/
-SESSION_DECK_OIDC_CLIENT_ID=your-client-id
-SESSION_DECK_OIDC_CLIENT_SECRET=your-client-secret
-SESSION_DECK_OIDC_REDIRECT_URI=https://deck.example.com/auth/callback
-SESSION_DECK_SESSION_SECRET=random-32-char-string
-```
-
-#### Trusted Networks (bypass auth)
-
-Allow unauthenticated access from specific networks:
-```bash
-SESSION_DECK_TRUSTED_NETWORKS=192.168.0.0/16,10.0.0.0/8
-```
-
-This is useful when running behind a VPN or on a trusted LAN — users from those networks skip the login page entirely.
+- Session Deck can execute commands inside configured tmux hosts by design. Only expose it on trusted networks or behind a reverse proxy with HTTPS.
+- Mounting `/var/run/docker.sock` enables Docker container support, but it effectively grants control over the host Docker daemon to authenticated Session Deck users.
+- Managed SSH private keys are stored under the data directory with `0600` permissions. Keep the `data/` directory private and out of source control.
+- The app has no anonymous mode: first launch requires account setup, and all API/WebSocket routes require authentication after setup.
 
 ### Run as a systemd Service
 

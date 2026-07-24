@@ -6,13 +6,14 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
 
-# Install backend dependencies (skip postinstall which tries to cd into frontend)
+# Install backend dependencies. Ignore lifecycle scripts so root postinstall
+# does not install frontend dependencies in this layer.
 COPY package.json package-lock.json ./
-RUN npm pkg delete scripts.postinstall && npm ci
+RUN npm ci --ignore-scripts
 
-# Install frontend dependencies (use install, not ci — lock file may drift across node versions)
+# Install frontend dependencies reproducibly from the lock file.
 COPY frontend/package.json frontend/package-lock.json ./frontend/
-RUN cd frontend && npm install --ignore-scripts
+RUN cd frontend && npm ci --ignore-scripts
 
 # Copy source and build frontend
 COPY frontend/ ./frontend/
@@ -23,9 +24,12 @@ COPY src/ ./src/
 FROM node:22-slim
 WORKDIR /app
 
-# Runtime dependencies: tmux (local session fallback), openssh-client (remote hosts)
+# Runtime dependencies:
+# - tmux for local session fallback
+# - openssh-client for remote hosts
+# - docker.io for Docker container hosts via the mounted Docker socket
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends tmux openssh-client \
+  && apt-get install -y --no-install-recommends tmux openssh-client docker.io \
   && rm -rf /var/lib/apt/lists/*
 
 # Copy built app
@@ -38,19 +42,12 @@ COPY public ./public
 # Create data directory for SQLite
 RUN mkdir -p /app/data
 
-# SSH config directory — copy at startup since mounted files have wrong ownership
+# SSH config directory for optional in-container SSH config/known_hosts use.
 RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
-# Entrypoint that fixes SSH permissions then starts the app
+# Entrypoint starts the app. Managed SSH keys are stored under /app/data.
 COPY <<'ENTRYPOINT' /app/entrypoint.sh
 #!/bin/sh
-if [ -d /ssh-mount ]; then
-  cp /ssh-mount/* /root/.ssh/ 2>/dev/null
-  chmod 700 /root/.ssh
-  chmod 600 /root/.ssh/config /root/.ssh/id_ed25519 2>/dev/null
-  chmod 644 /root/.ssh/id_ed25519.pub 2>/dev/null
-  chown -R root:root /root/.ssh
-fi
 exec node src/index.js
 ENTRYPOINT
 RUN chmod +x /app/entrypoint.sh

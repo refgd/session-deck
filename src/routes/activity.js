@@ -2,32 +2,15 @@
 // Returns session_activity timestamps only (no type/context detection).
 // Designed for 10s polling to power workspace notification badges.
 
-import { parseSSHConfig } from '../services/ssh-config.js';
 import { listAllActivity } from '../services/tmux.js';
+import { getSessionHosts } from '../services/hosts.js';
 
 export default async function activityRoutes(fastify) {
   const db = fastify.db;
 
   // GET /api/activity — returns { host, session, lastActivity } for all sessions
   fastify.get('/api/activity', async () => {
-    // Get hosts from managed_hosts DB, fall back to SSH config
-    let hosts;
-    const managed = db.prepare(
-      'SELECT * FROM managed_hosts WHERE enabled = 1 ORDER BY sort_order, name'
-    ).all();
-
-    if (managed.length > 0) {
-      hosts = managed.map(h => ({
-        name: h.name,
-        hostname: h.hostname,
-        user: h.user,
-        identityFile: h.identity_file,
-        group: h.group_name,
-        isLocal: !!h.is_local,
-      }));
-    } else {
-      hosts = parseSSHConfig();
-    }
+    const hosts = getSessionHosts(db);
 
     // Filter to tmux-capable hosts
     const tmuxHosts = hosts.filter(h => {

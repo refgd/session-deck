@@ -8,25 +8,14 @@ const config = {
 
   // Auth configuration
   auth: {
-    // 'none' | 'basic' | 'oidc'
-    method: process.env.SESSION_DECK_AUTH || 'none',
+    // Optional one-time bootstrap account. If no DB user exists, these values
+    // create the first admin automatically; otherwise first launch shows setup.
+    bootstrapUser: process.env.SESSION_DECK_AUTH_USER || '',
+    bootstrapPass: process.env.SESSION_DECK_AUTH_PASS || '',
 
-    // Basic auth
-    basicUser: process.env.SESSION_DECK_AUTH_USER || '',
-    basicPass: process.env.SESSION_DECK_AUTH_PASS || '',
-
-    // OIDC (Entra ID, Authentik, Keycloak, etc.)
-    oidcIssuer: process.env.SESSION_DECK_OIDC_ISSUER || '',       // e.g. https://login.microsoftonline.com/{tenant}/v2.0
-    oidcClientId: process.env.SESSION_DECK_OIDC_CLIENT_ID || '',
-    oidcClientSecret: process.env.SESSION_DECK_OIDC_CLIENT_SECRET || '',
-    oidcRedirectUri: process.env.SESSION_DECK_OIDC_REDIRECT_URI || '', // e.g. https://deck.hha.sh/auth/callback
-    oidcScopes: process.env.SESSION_DECK_OIDC_SCOPES || 'openid profile email',
-
-    // Trusted networks (bypass auth for these CIDRs)
-    trustedNetworks: process.env.SESSION_DECK_TRUSTED_NETWORKS || '', // e.g. '192.168.0.0/16,10.0.0.0/8'
-
-    // Session
-    sessionSecret: process.env.SESSION_DECK_SESSION_SECRET || 'session-deck-change-me-in-production',
+    // Session. If omitted, auth.js generates a persistent random secret under
+    // the data directory on first start.
+    sessionSecret: process.env.SESSION_DECK_SESSION_SECRET || '',
     sessionMaxAge: parseInt(process.env.SESSION_DECK_SESSION_MAX_AGE || '86400', 10), // 24h default
   },
 };
@@ -41,16 +30,12 @@ if (!validLogLevels.includes(config.logLevel)) {
   throw new Error(`Invalid log level: ${config.logLevel}. Must be one of: ${validLogLevels.join(', ')}`);
 }
 
-// Validate auth config
-const validAuthMethods = ['none', 'basic', 'oidc'];
-if (!validAuthMethods.includes(config.auth.method)) {
-  throw new Error(`Invalid auth method: ${config.auth.method}. Must be one of: ${validAuthMethods.join(', ')}`);
+if ((config.auth.bootstrapUser && !config.auth.bootstrapPass) || (!config.auth.bootstrapUser && config.auth.bootstrapPass)) {
+  throw new Error('SESSION_DECK_AUTH_USER and SESSION_DECK_AUTH_PASS must be set together');
 }
-if (config.auth.method === 'basic' && (!config.auth.basicUser || !config.auth.basicPass)) {
-  throw new Error('Basic auth requires SESSION_DECK_AUTH_USER and SESSION_DECK_AUTH_PASS');
-}
-if (config.auth.method === 'oidc' && (!config.auth.oidcIssuer || !config.auth.oidcClientId || !config.auth.oidcClientSecret)) {
-  throw new Error('OIDC auth requires SESSION_DECK_OIDC_ISSUER, SESSION_DECK_OIDC_CLIENT_ID, and SESSION_DECK_OIDC_CLIENT_SECRET');
+
+if (config.auth.sessionSecret && config.auth.sessionSecret.length < 32) {
+  throw new Error('SESSION_DECK_SESSION_SECRET must be at least 32 characters');
 }
 
 export default config;

@@ -1,19 +1,15 @@
 // src/routes/sessions.js — tmux sessions API
 
-import { parseSSHConfig } from '../services/ssh-config.js';
 import { listAllSessions, listSessions, createSession, renameSession, deleteSession, captureSession } from '../services/tmux.js';
 import { isValidSessionName } from '../lib/validate.js';
-
-function findHost(hostName) {
-  const hosts = parseSSHConfig();
-  const host = hosts.find(h => h.name === hostName || h.aliases.includes(hostName));
-  return host;
-}
+import { findHost, getSessionHosts } from '../services/hosts.js';
 
 export default async function sessionsRoutes(fastify) {
+  const db = fastify.db;
+
   // Get sessions from all configured hosts
   fastify.get('/api/sessions', async () => {
-    const hosts = parseSSHConfig();
+    const hosts = getSessionHosts(db);
 
     // Filter to tmux-capable hosts (skip network gear, clients)
     const tmuxHosts = hosts.filter(h => {
@@ -45,9 +41,13 @@ export default async function sessionsRoutes(fastify) {
   // Get sessions from a single host
   fastify.get('/api/sessions/:hostName', async (request, reply) => {
     const { hostName } = request.params;
-    const host = findHost(hostName);
-    if (!host) return reply.code(404).send({ error: `Host not found: ${hostName}` });
-    return await listSessions(host, { timeout: 5000 });
+    try {
+      const host = findHost(db, hostName);
+      if (!host) return reply.code(404).send({ error: `Host not found: ${hostName}`, host: hostName });
+      return await listSessions(host, { timeout: 5000 });
+    } catch (err) {
+      return reply.code(500).send(sessionErrorPayload(hostName, err));
+    }
   });
 
   // Create a session on a host
@@ -57,7 +57,7 @@ export default async function sessionsRoutes(fastify) {
     if (!isValidSessionName(name)) {
       return reply.code(400).send({ error: 'Invalid session name. Use only letters, digits, hyphens, underscores, and dots.' });
     }
-    const host = findHost(hostName);
+    const host = findHost(db, hostName);
     if (!host) return reply.code(404).send({ error: `Host not found: ${hostName}` });
 
     try {
@@ -76,7 +76,7 @@ export default async function sessionsRoutes(fastify) {
     if (!isValidSessionName(newName)) {
       return reply.code(400).send({ error: 'Invalid session name. Use only letters, digits, hyphens, underscores, and dots.' });
     }
-    const host = findHost(hostName);
+    const host = findHost(db, hostName);
     if (!host) return reply.code(404).send({ error: `Host not found: ${hostName}` });
 
     try {
@@ -91,7 +91,7 @@ export default async function sessionsRoutes(fastify) {
   // Delete a session on a host
   fastify.delete('/api/sessions/:hostName/:sessionName', async (request, reply) => {
     const { hostName, sessionName } = request.params;
-    const host = findHost(hostName);
+    const host = findHost(db, hostName);
     if (!host) return reply.code(404).send({ error: `Host not found: ${hostName}` });
 
     try {
@@ -106,7 +106,7 @@ export default async function sessionsRoutes(fastify) {
   // Send a rendering test to a tmux session
   fastify.post('/api/sessions/:hostName/:sessionName/render-test', async (request, reply) => {
     const { hostName, sessionName } = request.params;
-    const host = findHost(hostName);
+    const host = findHost(db, hostName);
     if (!host) return reply.code(404).send({ error: `Host not found: ${hostName}` });
 
     // The test string — covers ASCII, Unicode, box-drawing, emoji, math symbols
@@ -138,7 +138,9 @@ export default async function sessionsRoutes(fastify) {
       const execFileAsync = promisify(execFile);
 
       for (const line of lines) {
-        if (host.isLocal) {
+        if (host.connectionType === 'docker') {
+          await execFileAsync('docker', ['exec', host.dockerContainer || host.hostname, 'tmux', 'send-keys', '-t', sessionName, line, 'Enter'], { timeout: 5000 });
+        } else if (host.isLocal) {
           await execFileAsync('tmux', ['send-keys', '-t', sessionName, line, 'Enter'], { timeout: 2000 });
         } else {
           const sshArgs = [
@@ -164,7 +166,7 @@ export default async function sessionsRoutes(fastify) {
   fastify.get('/api/sessions/:hostName/:sessionName/capture', async (request, reply) => {
     const { hostName, sessionName } = request.params;
     const download = request.query.download === 'true';
-    const host = findHost(hostName);
+    const host = findHost(db, hostName);
     if (!host) return reply.code(404).send({ error: `Host not found: ${hostName}` });
 
     try {
@@ -185,4 +187,15 @@ export default async function sessionsRoutes(fastify) {
       return reply.code(err.statusCode || 500).send({ error: err.message });
     }
   });
+}
+
+function sessionErrorPayload(hostName, err) {
+  return {
+    error: err.message || 'Failed to load sessions',
+    message: err.message || null,
+    code: err.code || null,
+    path: err.path || null,
+    syscall: err.syscall || null,
+    host: hostName,
+  };
 }

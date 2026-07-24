@@ -2,6 +2,7 @@
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import formbody from '@fastify/formbody';
 import fastifyStatic from '@fastify/static';
 import fastifyWebSocket from '@fastify/websocket';
 import { join, dirname } from 'node:path';
@@ -22,14 +23,12 @@ import activityRoutes from './routes/activity.js';
 import templateRoutes from './routes/templates.js';
 import statusRoutes from './routes/status.js';
 import statusWsRoutes from './routes/status-ws.js';
+import { loadTypeMap } from './services/tmux.js';
 
 export async function buildServer() {
   const fastify = Fastify({
     logger: {
       level: config.logLevel,
-      transport: config.logLevel === 'debug' || config.logLevel === 'trace'
-        ? { target: 'pino-pretty', options: { colorize: true } }
-        : undefined,
     },
     trustProxy: true, // trust X-Forwarded-For from reverse proxy (Traefik, nginx)
   });
@@ -100,8 +99,7 @@ export async function buildServer() {
   });
 
   // Form body parsing (for login form POST)
-  const formbody = await import('@fastify/formbody');
-  await fastify.register(formbody.default);
+  await fastify.register(formbody);
 
   // Authentication (must be before routes)
   await registerAuth(fastify);
@@ -120,7 +118,6 @@ export async function buildServer() {
   await fastify.register(statusWsRoutes);
 
   // Load dynamic session type map after DB is ready
-  const { loadTypeMap } = await import('./services/tmux.js');
   loadTypeMap(db);
 
   return fastify;

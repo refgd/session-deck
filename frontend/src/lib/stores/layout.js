@@ -5,6 +5,8 @@
  *
  * Leaf (terminal pane):
  *   { session: 'main', host: 'reliant', size: 1 }
+ * Empty leaf:
+ *   { session: null, host: 'reliant', size: 1 }
  *
  * Split (container):
  *   { split: 'h' | 'v', children: [node, node, ...], size: 1 }
@@ -15,7 +17,7 @@
 /**
  * Create a leaf node for a session.
  */
-export function leaf(session, host = 'reliant', size = 1) {
+export function leaf(session = null, host = 'reliant', size = 1) {
   return { session, host, size };
 }
 
@@ -84,7 +86,7 @@ export function presets(sessionNames) {
  * Count total panes in a layout tree.
  */
 export function countPanes(node) {
-  if (node.session) return 1;
+  if (!node.children) return 1;
   if (node.children) return node.children.reduce((sum, c) => sum + countPanes(c), 0);
   return 0;
 }
@@ -116,9 +118,60 @@ export function getSessionPanes(node) {
  * Returns array of { session, host, path }.
  */
 export function getSessionPanesWithPaths(node, path = []) {
-  if (node.session) return [{ session: node.session, host: node.host || 'reliant', path }];
+  if (!node.children) return [{ session: node.session || null, host: node.host || 'reliant', path }];
   if (node.children) return node.children.flatMap((c, i) => getSessionPanesWithPaths(c, [...path, i]));
   return [];
+}
+
+/**
+ * Rebuild the layout into a sensible shape for the current pane count while
+ * preserving pane order and session assignments.
+ */
+export function autoArrangeLayout(node) {
+  const panes = collectLeaves(node);
+  if (panes.length === 0) return leaf(null);
+  if (panes.length === 1) return { ...panes[0], size: 1 };
+  if (panes.length === 2) return hsplit(panes.map(p => ({ ...p, size: 1 })));
+  if (panes.length === 3) {
+    return hsplit([
+      { ...panes[0], size: 2 },
+      vsplit([
+        { ...panes[1], size: 1 },
+        { ...panes[2], size: 1 },
+      ], 1),
+    ]);
+  }
+  if (panes.length === 4) {
+    return vsplit([
+      hsplit([{ ...panes[0], size: 1 }, { ...panes[1], size: 1 }]),
+      hsplit([{ ...panes[2], size: 1 }, { ...panes[3], size: 1 }]),
+    ]);
+  }
+
+  const columns = Math.ceil(Math.sqrt(panes.length));
+  const rowNodes = [];
+  for (let i = 0; i < panes.length; i += columns) {
+    const rowLeaves = panes.slice(i, i + columns).map(p => ({ ...p, size: 1 }));
+    if (rowLeaves.length === 1) {
+      rowNodes.push(rowLeaves[0]);
+    } else {
+      rowNodes.push(hsplit(rowLeaves));
+    }
+  }
+  return vsplit(rowNodes);
+}
+
+function collectLeaves(node) {
+  if (!node) return [];
+  if (!node.children) {
+    return [{
+      session: node.session || null,
+      host: node.host || 'reliant',
+      paneTitle: node.paneTitle || undefined,
+      size: 1,
+    }];
+  }
+  return node.children.flatMap(collectLeaves);
 }
 
 /**
@@ -127,7 +180,7 @@ export function getSessionPanesWithPaths(node, path = []) {
  * cycling if there are more panes than sessions.
  */
 export function applySessionsToTemplate(node, sessionNames, counter = { i: 0 }) {
-  if (node.session) {
+  if (!node.children) {
     const name = sessionNames[counter.i % sessionNames.length] || 'main';
     counter.i++;
     return { ...node, session: name };
@@ -162,11 +215,11 @@ export function removePane(root, path) {
   if (parent.children.length === 1) {
     const survivor = parent.children[0];
     // Replace parent's properties with survivor's
-    if (survivor.session) {
+    if (!survivor.children) {
       delete parent.split;
       delete parent.children;
-      parent.session = survivor.session;
-      parent.host = survivor.host;
+      parent.session = survivor.session || null;
+      parent.host = survivor.host || 'reliant';
     } else {
       parent.split = survivor.split;
       parent.children = survivor.children;
@@ -198,14 +251,14 @@ export function splitPaneAt(root, path, direction, newSession = 'main', newHost 
     target = target.children[path[i]];
   }
 
-  if (!target || !target.session) return root; // Can only split leaves
+  if (!target || target.children) return root; // Can only split leaves
 
   const newNode = {
     split: direction,
     size: target.size || 1,
     children: [
-      { session: target.session, host: target.host || 'reliant', size: 1 },
-      { session: newSession, host: newHost, size: 1 },
+      { session: target.session || null, host: target.host || 'reliant', size: 1 },
+      { session: newSession || null, host: newHost || 'reliant', size: 1 },
     ],
   };
 

@@ -1,12 +1,11 @@
 // src/routes/workspaces.js — Workspace CRUD API with SQLite persistence
 
-import { presetLayouts } from '../services/workspace-defaults.js';
-
 export default async function workspaceRoutes(fastify) {
   const db = fastify.db;
 
-  // Seed defaults on first run
-  seedDefaults(db);
+  // Older builds seeded example workspaces on first run. Remove only those
+  // generated defaults so new installs start empty and show the setup flow.
+  removeLegacyDefaults(db);
 
   // List all workspaces
   fastify.get('/api/workspaces', async () => {
@@ -91,19 +90,10 @@ export default async function workspaceRoutes(fastify) {
   });
 }
 
-function seedDefaults(db) {
-  const count = db.prepare('SELECT COUNT(*) as n FROM layout_presets').get().n;
-  if (count > 0) return; // Already seeded
-
-  const defaults = presetLayouts();
-  const insert = db.prepare(
-    'INSERT INTO layout_presets (name, description, layout_json, is_default, sort_order) VALUES (?, ?, ?, 1, ?)'
-  );
-
-  const tx = db.transaction(() => {
-    defaults.forEach((d, i) => {
-      insert.run(d.name, d.description, JSON.stringify(d.layout), i);
-    });
-  });
-  tx();
+function removeLegacyDefaults(db) {
+  db.prepare(`
+    DELETE FROM layout_presets
+    WHERE is_default = 1
+      AND name IN ('claude-focus', 'quad', 'deck')
+  `).run();
 }

@@ -2,6 +2,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { execDocker, execDockerShell } from './docker.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -47,9 +48,7 @@ export async function listSessions(host, options = {}) {
   const start = Date.now();
 
   try {
-    const rawSessions = host.isLocal
-      ? await execLocal(['list-sessions', '-F', SESSION_FORMAT], timeout)
-      : await execRemote(host, `tmux list-sessions -F '${SESSION_FORMAT}'`, timeout);
+    const rawSessions = await execTmux(host, ['list-sessions', '-F', SESSION_FORMAT], timeout);
 
     if (!rawSessions.trim()) {
       return result(host.name, 'online', [], start);
@@ -83,8 +82,11 @@ export async function listSessions(host, options = {}) {
 
     return result(host.name, 'online', enriched, start);
   } catch (err) {
+    if (isTmuxServerNotRunning(err)) {
+      return result(host.name, 'online', [], start);
+    }
     const status = classifyError(err);
-    return result(host.name, status, [], start, err.message);
+    return result(host.name, status, [], start, cleanError(err));
   }
 }
 
@@ -115,9 +117,7 @@ export async function listAllSessions(hosts, options = {}) {
 export async function listActivity(host, options = {}) {
   const timeout = options.timeout || 3000;
   try {
-    const raw = host.isLocal
-      ? await execLocal(['list-sessions', '-F', ACTIVITY_FORMAT], timeout)
-      : await execRemote(host, `tmux list-sessions -F '${ACTIVITY_FORMAT}'`, timeout);
+    const raw = await execTmux(host, ['list-sessions', '-F', ACTIVITY_FORMAT], timeout);
 
     if (!raw.trim()) return { host: host.name, sessions: [] };
 
@@ -157,9 +157,7 @@ export async function listAllActivity(hosts, options = {}) {
  */
 async function detectType(host, sessionName, timeout) {
   try {
-    const raw = host.isLocal
-      ? await execLocal(['list-panes', '-t', sessionName, '-F', PANE_FORMAT], timeout)
-      : await execRemote(host, `tmux list-panes -t '${sessionName}' -F '${PANE_FORMAT}'`, timeout);
+    const raw = await execTmux(host, ['list-panes', '-t', sessionName, '-F', PANE_FORMAT], timeout);
 
     const commands = raw.trim().split('\n').map(c => c.trim().toLowerCase());
     // Check all panes — first non-shell match wins, then fall back to shell type
@@ -188,9 +186,7 @@ async function detectContext(host, sessionName, timeout) {
   const ctx = { workingDir: null, repoName: null };
   try {
     // Get the current path of the first pane
-    const raw = host.isLocal
-      ? await execLocal(['list-panes', '-t', sessionName, '-F', PANE_PATH_FORMAT], timeout)
-      : await execRemote(host, `tmux list-panes -t '${sessionName}' -F '${PANE_PATH_FORMAT}'`, timeout);
+    const raw = await execTmux(host, ['list-panes', '-t', sessionName, '-F', PANE_PATH_FORMAT], timeout);
 
     const panePath = raw.trim().split('\n')[0]?.trim();
     if (!panePath) return ctx;
@@ -198,7 +194,15 @@ async function detectContext(host, sessionName, timeout) {
     ctx.workingDir = panePath;
 
     // Try to detect git repo name
-    if (host.isLocal) {
+    if (host.connectionType === 'docker') {
+      try {
+        const gitOut = await execDockerShell(host.dockerContainer || host.hostname, `cd '${shellQuoteInner(panePath)}' && git rev-parse --show-toplevel 2>/dev/null`, timeout);
+        const repoRoot = gitOut.trim();
+        if (repoRoot) {
+          ctx.repoName = repoRoot.split('/').pop();
+        }
+      } catch { /* not a git repo or git not installed */ }
+    } else if (host.isLocal) {
       try {
         const { stdout } = await execFileAsync('git', ['-C', panePath, 'rev-parse', '--show-toplevel'], { timeout: 2000 });
         const repoRoot = stdout.trim();
@@ -208,7 +212,7 @@ async function detectContext(host, sessionName, timeout) {
       } catch { /* not a git repo */ }
     } else {
       try {
-        const gitOut = await execRemote(host, `cd '${panePath}' && git rev-parse --show-toplevel 2>/dev/null`, timeout);
+        const gitOut = await execRemote(host, `cd ${shellQuote(panePath)} && git rev-parse --show-toplevel 2>/dev/null`, timeout);
         const repoRoot = gitOut.trim();
         if (repoRoot) {
           ctx.repoName = repoRoot.split('/').pop();
@@ -227,6 +231,14 @@ async function detectContext(host, sessionName, timeout) {
 async function execLocal(args, timeout) {
   const { stdout } = await execFileAsync('tmux', args, { timeout });
   return stdout;
+}
+
+async function execTmux(host, args, timeout) {
+  if (host.connectionType === 'docker') {
+    return execDocker(host.dockerContainer || host.hostname, ['tmux', ...args], timeout);
+  }
+  if (host.isLocal) return execLocal(args, timeout);
+  return execRemote(host, `tmux ${args.map(shellQuote).join(' ')}`, timeout);
 }
 
 async function execRemote(host, command, timeout) {
@@ -256,12 +268,7 @@ function classifyError(err) {
   if (msg.includes('Connection refused') || msg.includes('No route to host')) {
     return 'unreachable';
   }
-  if (msg.includes('no server running') || msg.includes('no current client') ||
-      msg.includes('failed to connect') || msg.includes('error connecting') ||
-      msg.includes('No such file or directory')) {
-    return 'no-tmux';
-  }
-  if (msg.includes('command not found')) {
+  if (msg.includes('command not found') || msg.includes('spawn tmux ENOENT')) {
     return 'no-tmux';
   }
   if (msg.includes('Permission denied')) {
@@ -270,11 +277,27 @@ function classifyError(err) {
   return 'error';
 }
 
+function isTmuxServerNotRunning(err) {
+  const msg = (err.message || '') + (err.stderr || '');
+  return msg.includes('no server running') ||
+    msg.includes('no current client') ||
+    msg.includes('error connecting to /tmp/tmux-') ||
+    msg.includes('failed to connect to server');
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function shellQuoteInner(value) {
+  return String(value).replace(/'/g, "'\\''");
+}
+
 /** Produce a clean user-facing error from a raw SSH/tmux error. */
 function cleanError(err) {
   const msg = (err.message || '') + (err.stderr || '');
-  if (msg.includes('command not found')) return 'tmux is not installed on this host';
-  if (msg.includes('no server running') || msg.includes('No such file or directory')) return 'tmux is not running on this host';
+  if (msg.includes('command not found') || msg.includes('spawn tmux ENOENT')) return 'tmux is not installed on this host';
+  if (isTmuxServerNotRunning(err)) return 'tmux is not running on this host';
   if (msg.includes('ETIMEDOUT') || msg.includes('timed out') || msg.includes('Connection timed out')) return 'host is unreachable (connection timed out)';
   if (msg.includes('Connection refused')) return 'connection refused';
   if (msg.includes('No route to host')) return 'host is unreachable (no route)';
@@ -330,10 +353,12 @@ export async function createSession(host, name, startDir) {
   if (startDir) args.push('-c', startDir);
 
   try {
-    if (host.isLocal) {
+    if (host.connectionType === 'docker') {
+      await execDocker(host.dockerContainer || host.hostname, ['tmux', ...args], 5000);
+    } else if (host.isLocal) {
       await execLocal(args, 5000);
     } else {
-      const cmd = `tmux new-session -d -s '${name}'${startDir ? ` -c '${startDir}'` : ''}`;
+      const cmd = `tmux new-session -d -s ${shellQuote(name)}${startDir ? ` -c ${shellQuote(startDir)}` : ''}`;
       await execRemote(host, cmd, 5000);
     }
     return { success: true, host: host.name, session: name };
@@ -356,10 +381,12 @@ export async function renameSession(host, oldName, newName) {
   validateSessionName(newName);
 
   try {
-    if (host.isLocal) {
+    if (host.connectionType === 'docker') {
+      await execDocker(host.dockerContainer || host.hostname, ['tmux', 'rename-session', '-t', oldName, newName], 5000);
+    } else if (host.isLocal) {
       await execLocal(['rename-session', '-t', oldName, newName], 5000);
     } else {
-      await execRemote(host, `tmux rename-session -t '${oldName}' '${newName}'`, 5000);
+      await execRemote(host, `tmux rename-session -t ${shellQuote(oldName)} ${shellQuote(newName)}`, 5000);
     }
     return { success: true, host: host.name, oldName, newName };
   } catch (err) {
@@ -378,10 +405,12 @@ export async function renameSession(host, oldName, newName) {
  */
 export async function deleteSession(host, name) {
   try {
-    if (host.isLocal) {
+    if (host.connectionType === 'docker') {
+      await execDocker(host.dockerContainer || host.hostname, ['tmux', 'kill-session', '-t', name], 5000);
+    } else if (host.isLocal) {
       await execLocal(['kill-session', '-t', name], 5000);
     } else {
-      await execRemote(host, `tmux kill-session -t '${name}'`, 5000);
+      await execRemote(host, `tmux kill-session -t ${shellQuote(name)}`, 5000);
     }
     return { success: true, host: host.name, session: name };
   } catch (err) {
@@ -389,6 +418,32 @@ export async function deleteSession(host, name) {
       throw Object.assign(new Error(`Session "${name}" not found on ${host.name}`), { statusCode: 404 });
     }
     throw Object.assign(new Error(`Failed to delete session on ${host.name}: ${cleanError(err)}`), { statusCode: 500 });
+  }
+}
+
+/**
+ * Scroll the active pane in a tmux session using tmux copy-mode history.
+ * @param {object} host
+ * @param {string} sessionName
+ * @param {number} lines Positive scrolls down, negative scrolls up.
+ */
+export async function scrollSession(host, sessionName, lines) {
+  const count = Math.max(1, Math.min(200, Math.abs(parseInt(lines, 10) || 1)));
+  const direction = lines > 0 ? 'scroll-down' : 'scroll-up';
+  const timeout = 2000;
+
+  if (host.connectionType === 'docker') {
+    await execDocker(host.dockerContainer || host.hostname, ['tmux', 'copy-mode', '-e', '-t', sessionName], timeout);
+    await execDocker(host.dockerContainer || host.hostname, ['tmux', 'send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
+  } else if (host.isLocal) {
+    await execLocal(['copy-mode', '-e', '-t', sessionName], timeout);
+    await execLocal(['send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
+  } else {
+    await execRemote(
+      host,
+      `tmux copy-mode -e -t ${shellQuote(sessionName)} \\; send-keys -t ${shellQuote(sessionName)} -X -N ${count} ${direction}`,
+      timeout
+    );
   }
 }
 
@@ -404,7 +459,13 @@ export async function captureSession(host, sessionName) {
   try {
     // List all window.pane indices in the session
     let paneList;
-    if (host.isLocal) {
+    if (host.connectionType === 'docker') {
+      paneList = await execDocker(
+        host.dockerContainer || host.hostname,
+        ['tmux', 'list-panes', '-t', sessionName, '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
+        timeout
+      );
+    } else if (host.isLocal) {
       paneList = await execLocal(
         ['list-panes', '-t', sessionName, '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
         timeout
@@ -412,7 +473,7 @@ export async function captureSession(host, sessionName) {
     } else {
       paneList = await execRemote(
         host,
-        `tmux list-panes -t '${sessionName}' -a -F '#{session_name}:#{window_index}.#{pane_index}'`,
+        `tmux list-panes -t ${shellQuote(sessionName)} -a -F '#{session_name}:#{window_index}.#{pane_index}'`,
         timeout
       );
     }
@@ -433,12 +494,18 @@ export async function captureSession(host, sessionName) {
 
       try {
         let output;
-        if (host.isLocal) {
+        if (host.connectionType === 'docker') {
+          output = await execDocker(
+            host.dockerContainer || host.hostname,
+            ['tmux', 'capture-pane', '-t', paneTarget, '-p', '-S', '-'],
+            timeout
+          );
+        } else if (host.isLocal) {
           output = await execLocal(['capture-pane', '-t', paneTarget, '-p', '-S', '-'], timeout);
         } else {
           output = await execRemote(
             host,
-            `tmux capture-pane -t '${paneTarget}' -p -S -`,
+            `tmux capture-pane -t ${shellQuote(paneTarget)} -p -S -`,
             timeout
           );
         }

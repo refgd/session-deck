@@ -1,8 +1,10 @@
 // src/routes/terminal-ws.js — WebSocket route for terminal I/O
 
 import { spawnTerminal, resizeTerminal, killTerminal } from '../services/terminal.js';
+import { findHost } from '../services/hosts.js';
+import { scrollSession } from '../services/tmux.js';
 import statusEngine from '../services/status-engine.js';
-import config from '../lib/config.js';
+import { hasUsers } from '../lib/auth.js';
 import { randomBytes } from 'node:crypto';
 
 // Short-lived WS auth tokens — valid for 30 seconds
@@ -25,25 +27,6 @@ function validateWsToken(token) {
   return Date.now() - entry.created < 30000;
 }
 
-// CIDR check (duplicated from auth.js to avoid circular imports)
-function isTrustedIp(ip) {
-  const networks = config.auth.trustedNetworks;
-  if (!networks) return false;
-  const ranges = networks.split(',').map(s => s.trim()).filter(Boolean).map(cidr => {
-    const [addr, bits] = cidr.split('/');
-    const mask = bits ? parseInt(bits, 10) : 32;
-    const parts = addr.split('.').map(Number);
-    const ipNum = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
-    const maskNum = (~0 << (32 - mask)) >>> 0;
-    return { start: (ipNum & maskNum) >>> 0, end: ((ipNum & maskNum) | (~maskNum >>> 0)) >>> 0 };
-  });
-  const normalizedIp = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
-  const parts = normalizedIp.split('.').map(Number);
-  if (parts.length !== 4 || parts.some(p => isNaN(p))) return false;
-  const ipNum = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
-  return ranges.some(r => ipNum >= r.start && ipNum <= r.end);
-}
-
 export default async function terminalWsRoutes(fastify) {
   // Token endpoint — authenticated users get a short-lived WS token
   fastify.get('/api/ws-token', async (req, reply) => {
@@ -53,16 +36,17 @@ export default async function terminalWsRoutes(fastify) {
   });
 
   fastify.get('/ws/terminal', { websocket: true }, (socket, req) => {
-    // Auth check: accept session cookie, trusted IP, OR valid WS token
-    if (config.auth.method !== 'none') {
-      const isAuthenticated = req.session?.authenticated;
-      const isTrusted = isTrustedIp(req.ip);
-      const tokenValid = req.query.token ? validateWsToken(req.query.token) : false;
-      if (!isAuthenticated && !isTrusted && !tokenValid) {
-        fastify.log.warn({ ip: req.ip, isAuthenticated, isTrusted, tokenValid }, 'WebSocket auth rejected');
-        socket.close(1008, 'Authentication required');
-        return;
-      }
+    // Auth check: accept session cookie or valid one-time WS token.
+    if (!hasUsers(fastify.db)) {
+      socket.close(1008, 'Setup required');
+      return;
+    }
+    const isAuthenticated = req.session?.authenticated;
+    const tokenValid = req.query.token ? validateWsToken(req.query.token) : false;
+    if (!isAuthenticated && !tokenValid) {
+      fastify.log.warn({ ip: req.ip, isAuthenticated, tokenValid }, 'WebSocket auth rejected');
+      socket.close(1008, 'Authentication required');
+      return;
     }
 
     const session = req.query.session;
@@ -81,7 +65,7 @@ export default async function terminalWsRoutes(fastify) {
 
     let terminal;
     try {
-      terminal = spawnTerminal(session, host, { cols, rows });
+      terminal = spawnTerminal(session, host, { cols, rows, db: fastify.db });
     } catch (err) {
       fastify.log.error({ err, session, host }, 'Failed to spawn terminal');
       socket.close(1011, `Failed to spawn: ${err.message}`);
@@ -89,6 +73,8 @@ export default async function terminalWsRoutes(fastify) {
     }
 
     const { pty: term, id } = terminal;
+    const startedAt = Date.now();
+    let recentOutput = '';
 
     fastify.log.info({ id, session, host }, 'Terminal PTY spawned');
 
@@ -97,6 +83,7 @@ export default async function terminalWsRoutes(fastify) {
 
     // PTY output → WebSocket + status engine
     term.onData((data) => {
+      recentOutput = (recentOutput + data).slice(-1000);
       try {
         if (socket.readyState === 1) { // OPEN
           socket.send(data);
@@ -113,7 +100,8 @@ export default async function terminalWsRoutes(fastify) {
       fastify.log.info({ id, session, exitCode, signal }, 'Terminal PTY exited');
       statusEngine.remove(id);
       try {
-        socket.close(1000, 'PTY exited');
+        const reason = terminalExitReason({ exitCode, signal, recentOutput, ageMs: Date.now() - startedAt });
+        socket.close(reason.code, reason.message);
       } catch {
         // Already closed
       }
@@ -130,6 +118,13 @@ export default async function terminalWsRoutes(fastify) {
           const msg = JSON.parse(str);
           if (msg.type === 'resize' && msg.cols && msg.rows) {
             resizeTerminal(id, msg.cols, msg.rows);
+            return;
+          }
+          if (msg.type === 'scroll' && Number.isFinite(msg.lines) && msg.lines !== 0) {
+            const targetHost = findHost(fastify.db, host) || { name: host, isLocal: true, connectionType: 'ssh' };
+            scrollSession(targetHost, session, msg.lines).catch((err) => {
+              fastify.log.warn({ err, session, host }, 'Failed to scroll terminal session');
+            });
             return;
           }
         } catch {
@@ -158,4 +153,43 @@ export default async function terminalWsRoutes(fastify) {
       killTerminal(id);
     });
   });
+}
+
+function terminalExitReason({ exitCode, signal, recentOutput, ageMs }) {
+  const output = cleanTerminalOutput(recentOutput);
+  let message = output || `Terminal exited${typeof exitCode === 'number' ? ` with code ${exitCode}` : ''}${signal ? ` (${signal})` : ''}`;
+
+  if (output.includes("can't find session") || output.includes('no such session')) {
+    message = output;
+  } else if (output.includes('no sessions')) {
+    message = 'tmux session does not exist or was deleted';
+  } else if (output.includes('error connecting to /tmp/tmux-') || output.includes('no server running')) {
+    message = 'tmux is not running or the session no longer exists';
+  } else if (output.includes('command not found') || output.includes('not found')) {
+    message = output;
+  } else if (!output && ageMs < 2000) {
+    message = 'Terminal exited immediately';
+  }
+
+  return {
+    code: exitCode === 0 && ageMs >= 2000 ? 1000 : 1011,
+    message: truncateCloseReason(message),
+  };
+}
+
+function cleanTerminalOutput(value) {
+  return String(value || '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .slice(-3)
+    .join(' | ')
+    .trim();
+}
+
+function truncateCloseReason(value) {
+  const text = String(value || 'Terminal exited');
+  return text.length > 120 ? `${text.slice(0, 117)}...` : text;
 }

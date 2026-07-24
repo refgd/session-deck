@@ -2,6 +2,7 @@
 
 import pty from 'node-pty';
 import { parseSSHConfig } from './ssh-config.js';
+import { findHost } from './hosts.js';
 
 const activePTYs = new Map();
 
@@ -20,9 +21,24 @@ export function spawnTerminal(sessionName, hostName, options = {}) {
   const id = `${hostName}:${sessionName}:${Date.now()}`;
 
   let shell, args;
-  const host = resolveHost(hostName);
+  const host = resolveHost(hostName, options.db);
 
-  if (!host || host.isLocal) {
+  if (host?.connectionType === 'docker') {
+    shell = 'docker';
+    args = [
+      'exec',
+      '-it',
+      '-e', 'TERM=xterm-256color',
+      '-e', 'LANG=C.UTF-8',
+      '-e', 'LC_ALL=C.UTF-8',
+      host.dockerContainer || host.hostname,
+      'tmux',
+      '-u',
+      'attach-session',
+      '-t',
+      sessionName,
+    ];
+  } else if (!host || host.isLocal) {
     // Local tmux attach — -u forces UTF-8 mode regardless of host locale
     shell = 'tmux';
     args = ['-u', 'attach-session', '-t', sessionName];
@@ -113,9 +129,13 @@ export function getActiveCount() {
   return activePTYs.size;
 }
 
-function resolveHost(hostName) {
+function resolveHost(hostName, db) {
   if (!hostName || hostName === 'localhost') {
     return { isLocal: true };
+  }
+  if (db) {
+    const managed = findHost(db, hostName);
+    if (managed) return managed;
   }
   // Check managed hosts DB via SSH config — don't hardcode any host as local
   const hosts = parseSSHConfig();

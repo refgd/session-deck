@@ -6,7 +6,13 @@
   // Buttons use pointerdown + preventDefault so tapping them never steals focus
   // from xterm's hidden textarea — the soft keyboard stays up.
 
-  let { onKey = () => {}, onShowKeyboard = () => {}, onCtrlToggle = () => {} } = $props();
+  import { translate } from './i18n.js';
+
+  let { onKey = () => {}, onShowKeyboard = () => {}, onCtrlToggle = () => {}, language = 'en' } = $props();
+
+  function t(key, params = {}) {
+    return translate(language, key, params);
+  }
 
   let ctrlActive = $state(false);
 
@@ -21,13 +27,13 @@
   const NAV_KEYS = [
     { label: 'Esc', seq: ESC, wide: true },
     { label: 'Tab', seq: '\t' },
-    { label: '⌃C', seq: '\x03', title: 'Interrupt (Ctrl-C)' },
-    { label: '⌫', seq: '\x7f', title: 'Backspace' },
+    { label: '⌃C', seq: '\x03', titleKey: 'interrupt' },
+    { label: '⌫', seq: '\x7f', titleKey: 'backspace' },
     { label: '←', seq: ESC + '[D' },
     { label: '↑', seq: ESC + '[A' },
     { label: '↓', seq: ESC + '[B' },
     { label: '→', seq: ESC + '[C' },
-    { label: '↵', seq: '\r', accent: true, title: 'Enter' },
+    { label: '↵', seq: '\r', accent: true, titleKey: 'enter' },
   ];
 
   const NUMBERS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
@@ -47,26 +53,26 @@
   }
 </script>
 
-<div class="keybar" role="toolbar" aria-label="Terminal key bar" tabindex="-1" onpointerdown={(e) => e.preventDefault()}>
+<div class="keybar" role="toolbar" aria-label={t('terminalKeyBar')} tabindex="-1" onpointerdown={(e) => e.preventDefault()}>
   <div class="keybar-row">
     {#each NAV_KEYS as k}
       <button
         class="key"
         class:wide={k.wide}
         class:accent={k.accent}
-        title={k.title || k.label}
+        title={k.titleKey ? t(k.titleKey) : k.label}
         onpointerdown={(e) => { e.preventDefault(); tapKey(k.seq); }}
       >{k.label}</button>
     {/each}
     <button
       class="key ctrl"
       class:armed={ctrlActive}
-      title="Ctrl — next key becomes a control char"
+      title={t('ctrlNext')}
       onpointerdown={(e) => { e.preventDefault(); toggleCtrl(); }}
     >Ctrl</button>
     <button
       class="key kbd"
-      title="Show keyboard"
+      title={t('showKeyboard')}
       onpointerdown={(e) => { e.preventDefault(); onShowKeyboard(); }}
     >⌨</button>
   </div>

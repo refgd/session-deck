@@ -16,21 +16,15 @@ services:
       - SESSION_DECK_HOST=0.0.0.0
       - SESSION_DECK_LOG_LEVEL=info
       - SESSION_DECK_DB_PATH=/app/data/session-deck.db
-      - SESSION_DECK_AUTH=${SESSION_DECK_AUTH:-none}
-      - SESSION_DECK_OIDC_ISSUER=${SESSION_DECK_OIDC_ISSUER:-}
-      - SESSION_DECK_OIDC_CLIENT_ID=${SESSION_DECK_OIDC_CLIENT_ID:-}
-      - SESSION_DECK_OIDC_CLIENT_SECRET=${SESSION_DECK_OIDC_CLIENT_SECRET:-}
-      - SESSION_DECK_OIDC_REDIRECT_URI=${SESSION_DECK_OIDC_REDIRECT_URI:-}
-      - SESSION_DECK_OIDC_SCOPES=${SESSION_DECK_OIDC_SCOPES:-openid profile email}
-      - SESSION_DECK_TRUSTED_NETWORKS=${SESSION_DECK_TRUSTED_NETWORKS:-}
       - SESSION_DECK_SESSION_SECRET=${SESSION_DECK_SESSION_SECRET:-}
       - SESSION_DECK_SESSION_MAX_AGE=${SESSION_DECK_SESSION_MAX_AGE:-86400}
       - LANG=C.UTF-8
       - LC_ALL=C.UTF-8
+      - DOCKER_HOST=unix:///var/run/docker.sock
     volumes:
       # Persist SQLite database across rebuilds
       - ./data:/app/data
-      # SSH keys for connecting to tmux hosts (copied to /root/.ssh at startup with correct perms)
-      - ./ssh:/ssh-mount:ro
+      # Allow Session Deck to list and exec into running Docker containers on the host
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - 1panel-network

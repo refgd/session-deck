@@ -2,6 +2,30 @@
 
 export default async function settingsRoutes(fastify) {
   const db = fastify.db;
+  const settingValidators = {
+    accent_color(value) {
+      if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) {
+        throw Object.assign(new Error('accent_color must be a #RRGGBB color'), { statusCode: 400 });
+      }
+      return value;
+    },
+  };
+  const PROCESS_NAME_RE = /^[a-zA-Z0-9_.:-]{1,64}$/;
+
+  function validateColor(color, fallback = '#6b7688') {
+    if (color === undefined || color === null || color === '') return fallback;
+    if (typeof color !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(color)) {
+      throw Object.assign(new Error('color must be a #RRGGBB color'), { statusCode: 400 });
+    }
+    return color;
+  }
+
+  function validateLabel(value, fallback) {
+    const label = String(value || fallback || '').trim();
+    if (!label) throw Object.assign(new Error('display_name is required'), { statusCode: 400 });
+    if (label.length > 64) throw Object.assign(new Error('display_name must be 64 characters or fewer'), { statusCode: 400 });
+    return label;
+  }
 
   // --- App Settings ---
 
@@ -14,13 +38,18 @@ export default async function settingsRoutes(fastify) {
   });
 
   // Update a setting
-  fastify.put('/api/settings/:key', async (request) => {
+  fastify.put('/api/settings/:key', async (request, reply) => {
     const { key } = request.params;
     const { value } = request.body;
+    const validate = settingValidators[key];
+    if (!validate) {
+      return reply.code(404).send({ error: 'Unknown setting' });
+    }
+    const nextValue = validate(value);
     db.prepare(
       "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = datetime('now')"
-    ).run(key, value, value);
-    return { key, value };
+    ).run(key, nextValue, nextValue);
+    return { key, value: nextValue };
   });
 
   // --- Session Types ---
@@ -37,13 +66,17 @@ export default async function settingsRoutes(fastify) {
     if (!existing) return reply.code(404).send({ error: 'Session type not found' });
 
     const { display_name, color } = request.body;
-    db.prepare(
-      "UPDATE session_types SET display_name = ?, color = ?, created_at = COALESCE(created_at, datetime('now')) WHERE id = ?"
-    ).run(
-      display_name ?? existing.display_name,
-      color ?? existing.color,
-      existing.id
-    );
+    try {
+      db.prepare(
+        "UPDATE session_types SET display_name = ?, color = ?, created_at = COALESCE(created_at, datetime('now')) WHERE id = ?"
+      ).run(
+        validateLabel(display_name ?? existing.display_name, existing.display_name),
+        validateColor(color ?? existing.color, existing.color),
+        existing.id
+      );
+    } catch (err) {
+      return reply.code(err.statusCode || 400).send({ error: err.message });
+    }
 
     return db.prepare('SELECT * FROM session_types WHERE id = ?').get(existing.id);
   });
@@ -51,24 +84,30 @@ export default async function settingsRoutes(fastify) {
   // Add a new session type
   fastify.post('/api/session-types', async (request, reply) => {
     const { process_name, display_name, color } = request.body;
-    if (!process_name?.trim()) {
-      return reply.code(400).send({ error: 'process_name is required' });
+    const processName = String(process_name || '').trim();
+    if (!PROCESS_NAME_RE.test(processName)) {
+      return reply.code(400).send({ error: 'process_name must be 1-64 characters and use letters, numbers, _, ., :, or -' });
     }
 
-    const existing = db.prepare('SELECT id FROM session_types WHERE process_name = ?').get(process_name.trim());
+    const existing = db.prepare('SELECT id FROM session_types WHERE process_name = ?').get(processName);
     if (existing) {
-      return reply.code(409).send({ error: `Type "${process_name}" already exists` });
+      return reply.code(409).send({ error: `Type "${processName}" already exists` });
     }
 
     const maxSort = db.prepare('SELECT MAX(sort_order) as m FROM session_types').get();
-    const result = db.prepare(
-      'INSERT INTO session_types (process_name, display_name, color, sort_order) VALUES (?, ?, ?, ?)'
-    ).run(
-      process_name.trim(),
-      display_name?.trim() || process_name.trim(),
-      color || '#6b7688',
-      (maxSort?.m ?? 99) + 1
-    );
+    let result;
+    try {
+      result = db.prepare(
+        'INSERT INTO session_types (process_name, display_name, color, sort_order) VALUES (?, ?, ?, ?)'
+      ).run(
+        processName,
+        validateLabel(display_name, processName),
+        validateColor(color),
+        (maxSort?.m ?? 99) + 1
+      );
+    } catch (err) {
+      return reply.code(err.statusCode || 400).send({ error: err.message });
+    }
 
     reply.code(201);
     return db.prepare('SELECT * FROM session_types WHERE id = ?').get(result.lastInsertRowid);

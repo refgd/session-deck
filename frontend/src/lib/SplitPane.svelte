@@ -1,6 +1,7 @@
 <script>
   import Terminal from './Terminal.svelte';
   import SplitPane from './SplitPane.svelte';
+  import { translate } from './i18n.js';
 
   let {
     node,
@@ -18,11 +19,16 @@
     getTypeInfo = () => ({ color: '#6b7688', label: 'TERM', context: null }),
     parentSplit = null,
     siblingCount = 0,
+    language = 'en',
   } = $props();
 
   let resizing = $state(false);
   let containerEl = $state(null);
   let dropZone = $state(null); // 'left' | 'right' | 'top' | 'bottom' | null
+
+  function t(key, params = {}) {
+    return translate(language, key, params);
+  }
 
   function startResize(index, event) {
     event.preventDefault();
@@ -62,7 +68,7 @@
 
   function nodeId(child) {
     if (child.session) return `${child.host || 'reliant'}:${child.session}`;
-    return `split-${child.split}-${child.children?.length}`;
+    return `empty:${path.join('.') || 'root'}`;
   }
 
   function handleSessionClick(session) {
@@ -118,13 +124,15 @@
   }
 </script>
 
-{#if node.session}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
+{#if !node.children}
   <div
     class="pane-leaf"
-    role="group"
+    class:empty={!node.session}
+    role="button"
+    tabindex="0"
     style="flex: {node.size || 1}"
     onclick={() => onFocus(nodeId(node))}
+    onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && onFocus(nodeId(node))}
     ondragover={handleDragOver}
     ondragleave={handleDragLeave}
     ondrop={handleDropOnPane}
@@ -132,23 +140,37 @@
     {#if dropZone}
       <div class="drop-indicator {dropZone}"></div>
     {/if}
-    <Terminal
-      session={node.session}
-      host={node.host || 'reliant'}
-      focused={focusedId === nodeId(node)}
-      zoomed={zoomedId === nodeId(node)}
-      sessionType={node.session}
-      sessionTypeColor={getTypeInfo(node.session).color}
-      sessionTypeLabel={getTypeInfo(node.session).label}
-      sessionContext={getTypeInfo(node.session).context}
-      paneTitle={node.paneTitle || null}
-      onSessionClick={() => handleSessionClick(node.session)}
-      onZoom={() => onZoom(nodeId(node), node.session, node.host || 'reliant', path)}
-      onSplit={(dir) => onSplit(path, dir)}
-      onClose={() => onClose(path)}
-      onDragStart={() => {}}
-      onContextMenu={(e) => onPaneContextMenu(e, path, node.session, node.host || 'reliant')}
-    />
+    <button class="pane-plus" title={t('addPane')} onclick={(e) => { e.stopPropagation(); onSplit(path, 'h'); }}>+</button>
+    {#if node.session}
+      <Terminal
+        session={node.session}
+        host={node.host || 'reliant'}
+        focused={focusedId === nodeId(node)}
+        zoomed={zoomedId === nodeId(node)}
+        sessionType={node.session}
+        sessionTypeColor={getTypeInfo(node.session).color}
+        sessionTypeLabel={getTypeInfo(node.session).label}
+        sessionContext={getTypeInfo(node.session).context}
+        paneTitle={node.paneTitle || null}
+        {language}
+        onSessionClick={() => handleSessionClick(node.session)}
+        onZoom={() => onZoom(nodeId(node), node.session, node.host || 'reliant', path)}
+        onSplit={(dir) => onSplit(path, dir)}
+        onClose={() => onClose(path)}
+        onDragStart={() => {}}
+        onContextMenu={(e) => onPaneContextMenu(e, path, node.session, node.host || 'reliant')}
+      />
+    {:else}
+      <div class="empty-pane">
+        <button class="empty-close" title={t('closePane')} onclick={(e) => { e.stopPropagation(); onClose(path); }}>
+          <span class="empty-close-icon"></span>
+        </button>
+        <button class="add-session-btn" onclick={(e) => { e.stopPropagation(); handleSessionClick(null); }}>
+          <span class="add-session-plus">+</span>
+          <span>{t('addSession')}</span>
+        </button>
+      </div>
+    {/if}
   </div>
 {:else if node.split && node.children}
   <div
@@ -172,6 +194,7 @@
         {onDrop}
         {onPaneContextMenu}
         {getTypeInfo}
+        {language}
         parentSplit={node.split}
         siblingCount={node.children.length}
       />
@@ -190,6 +213,61 @@
 
 <style>
   .pane-leaf { min-width: 0; min-height: 0; overflow: hidden; position: relative; }
+  .pane-plus {
+    position: absolute; top: 8px; right: 8px; z-index: 30;
+    width: 24px; height: 24px; border-radius: 50%;
+    border: 1px solid rgba(197,205,217,0.16);
+    background: rgba(21,27,35,0.9); color: #c5cdd9;
+    font-size: 16px; line-height: 1; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .pane-leaf:not(.empty) .pane-plus {
+    top: 34px;
+    opacity: 0;
+    transition: opacity 0.12s, border-color 0.12s, color 0.12s;
+  }
+  .pane-leaf:not(.empty):hover .pane-plus { opacity: 1; }
+  .pane-plus:hover { border-color: var(--accent, #F97316); color: var(--accent, #F97316); }
+  .empty-pane {
+    position: relative;
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    background: #0b0e11; border: 1px solid #161b22; border-radius: 6px;
+  }
+  .empty-close {
+    position: absolute; top: 8px; left: 8px;
+    width: 24px; height: 24px; border-radius: 4px;
+    border: 1px solid transparent;
+    background: transparent; color: #3d4450; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .empty-close:hover {
+    background: rgba(240,113,120,0.15);
+    border-color: rgba(240,113,120,0.25);
+    color: #f07178;
+  }
+  .empty-close-icon {
+    display: block; width: 10px; height: 10px; position: relative;
+  }
+  .empty-close-icon::before, .empty-close-icon::after {
+    content: ''; position: absolute; top: 50%; left: 50%;
+    width: 10px; height: 1.5px; background: currentColor;
+  }
+  .empty-close-icon::before { transform: translate(-50%, -50%) rotate(45deg); }
+  .empty-close-icon::after { transform: translate(-50%, -50%) rotate(-45deg); }
+  .add-session-btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-radius: 6px;
+    border: 1px solid rgba(249,115,22,0.28);
+    background: rgba(249,115,22,0.08); color: var(--accent, #F97316);
+    font-size: 13px; font-family: 'DM Sans', sans-serif; cursor: pointer;
+  }
+  .add-session-btn:hover { background: rgba(249,115,22,0.14); border-color: var(--accent, #F97316); }
+  .add-session-plus {
+    width: 18px; height: 18px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid currentColor; font-size: 14px; line-height: 1;
+  }
   .split-container {
     display: flex; min-width: 0; min-height: 0;
     overflow: hidden; width: 100%; height: 100%;

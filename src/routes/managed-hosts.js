@@ -3,6 +3,8 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseSSHConfig } from '../services/ssh-config.js';
+import { execDocker, listRunningContainers } from '../services/docker.js';
+import { deleteSshKey, listSshKeys, saveSshKey } from '../services/ssh-keys.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,7 +25,33 @@ async function testHost(host) {
   };
 
   try {
-    if (host.is_local) {
+    const connectionType = host.connection_type || (host.auth_method === 'docker' ? 'docker' : 'ssh');
+
+    if (connectionType === 'docker') {
+      const container = host.docker_container || host.hostname;
+      const { stdout: running } = await execFileAsync('docker', ['inspect', '-f', '{{.State.Running}}', container], { timeout: 5000 });
+      if (running.trim() !== 'true') {
+        throw new Error('Container is not running');
+      }
+      result.status = 'ok';
+
+      try {
+        const stdout = await execDocker(container, ['tmux', '-V'], 5000);
+        result.tmuxAvailable = true;
+        result.tmuxVersion = stdout.trim();
+      } catch {
+        result.tmuxAvailable = false;
+        try {
+          const stdout = await execDocker(container, ['cat', '/etc/os-release'], 5000);
+          const idMatch = stdout.match(/^ID=(.+)$/m);
+          const nameMatch = stdout.match(/^PRETTY_NAME="?(.+?)"?$/m);
+          result.osId = idMatch?.[1]?.replace(/"/g, '') || null;
+          result.os = nameMatch?.[1] || result.osId;
+        } catch {
+          result.os = 'Container';
+        }
+      }
+    } else if (host.is_local) {
       // Local host — direct exec
       try {
         const { stdout } = await execFileAsync('tmux', ['-V'], { timeout: 5000 });
@@ -99,6 +127,40 @@ async function testHost(host) {
   return result;
 }
 
+async function installTmux(host) {
+  const test = await testHost(host);
+  if (test.status !== 'ok') {
+    throw Object.assign(new Error(test.error || 'Host is not reachable'), { statusCode: 503 });
+  }
+  if (test.tmuxAvailable) {
+    return { installed: false, alreadyInstalled: true, test };
+  }
+
+  if (!test.osId) {
+    throw Object.assign(new Error('Could not detect OS for tmux installation'), { statusCode: 400 });
+  }
+
+  const connectionType = host.connection_type || (host.auth_method === 'docker' ? 'docker' : 'ssh');
+  const useSudo = connectionType !== 'docker';
+  const installCommand = getInstallCommand(test.osId, { sudo: useSudo });
+
+  if (!installCommand || installCommand.startsWith('#')) {
+    throw Object.assign(new Error(`Unsupported OS for automatic install: ${test.osId}`), { statusCode: 400 });
+  }
+
+  if (connectionType === 'docker') {
+    await execFileAsync('docker', ['exec', host.docker_container || host.hostname, 'sh', '-lc', installCommand], { timeout: 120000 });
+  } else if (host.is_local) {
+    await execFileAsync('sh', ['-lc', installCommand], { timeout: 120000 });
+  } else {
+    const sshArgs = buildSSHArgs(host);
+    await execFileAsync('ssh', [...sshArgs, installCommand], { timeout: 120000 });
+  }
+
+  const after = await testHost(host);
+  return { installed: after.tmuxAvailable, alreadyInstalled: false, installCommand, test: after };
+}
+
 /**
  * Build SSH command arguments for a host.
  */
@@ -118,17 +180,18 @@ function buildSSHArgs(host) {
 /**
  * Get tmux install command for a given OS ID.
  */
-function getInstallCommand(osId) {
+function getInstallCommand(osId, options = {}) {
+  const sudo = options.sudo === false ? '' : 'sudo ';
   const commands = {
-    ubuntu: 'sudo apt install -y tmux',
-    debian: 'sudo apt install -y tmux',
-    fedora: 'sudo dnf install -y tmux',
-    centos: 'sudo yum install -y tmux',
-    rhel: 'sudo yum install -y tmux',
-    arch: 'sudo pacman -S tmux',
-    alpine: 'sudo apk add tmux',
-    opensuse: 'sudo zypper install -y tmux',
-    freebsd: 'sudo pkg install tmux',
+    ubuntu: `${sudo}apt-get update && ${sudo}DEBIAN_FRONTEND=noninteractive apt-get install -y tmux`,
+    debian: `${sudo}apt-get update && ${sudo}DEBIAN_FRONTEND=noninteractive apt-get install -y tmux`,
+    fedora: `${sudo}dnf install -y tmux`,
+    centos: `${sudo}yum install -y tmux`,
+    rhel: `${sudo}yum install -y tmux`,
+    arch: `${sudo}pacman -Sy --noconfirm tmux`,
+    alpine: `${sudo}apk add --no-cache tmux`,
+    opensuse: `${sudo}zypper install -y tmux`,
+    freebsd: `${sudo}pkg install -y tmux`,
     darwin: 'brew install tmux',
   };
   return commands[osId] || `# Install tmux for ${osId}`;
@@ -136,6 +199,36 @@ function getInstallCommand(osId) {
 
 export default async function managedHostsRoutes(fastify) {
   const db = fastify.db;
+
+  fastify.get('/api/docker/containers', async (request, reply) => {
+    try {
+      return { containers: await listRunningContainers() };
+    } catch (err) {
+      return reply.code(503).send({ error: err.message || 'Failed to list Docker containers' });
+    }
+  });
+
+  fastify.get('/api/ssh-keys', async () => {
+    return { keys: listSshKeys() };
+  });
+
+  fastify.post('/api/ssh-keys', async (request, reply) => {
+    try {
+      const key = saveSshKey(request.body || {});
+      reply.code(201);
+      return key;
+    } catch (err) {
+      return reply.code(err.statusCode || 500).send({ error: err.message });
+    }
+  });
+
+  fastify.delete('/api/ssh-keys/:name', async (request, reply) => {
+    try {
+      return deleteSshKey(request.params.name);
+    } catch (err) {
+      return reply.code(err.statusCode || 500).send({ error: err.message });
+    }
+  });
 
   // List all managed hosts
   fastify.get('/api/managed-hosts', async () => {
@@ -158,8 +251,11 @@ export default async function managedHostsRoutes(fastify) {
 
   // Create host
   fastify.post('/api/managed-hosts', async (request, reply) => {
-    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled } = request.body;
-    if (!name?.trim() || !hostname?.trim()) {
+    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container } = request.body;
+    const connectionType = connection_type === 'docker' ? 'docker' : 'ssh';
+    const containerName = docker_container?.trim() || null;
+    const resolvedHostname = connectionType === 'docker' ? containerName : hostname?.trim();
+    if (!name?.trim() || !resolvedHostname) {
       return reply.code(400).send({ error: 'Name and hostname are required' });
     }
 
@@ -173,17 +269,19 @@ export default async function managedHostsRoutes(fastify) {
     const nextSort = (maxSort?.m ?? -1) + 1;
 
     const result = db.prepare(`
-      INSERT INTO managed_hosts (name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO managed_hosts (name, hostname, user, port, identity_file, auth_method, group_name, is_local, connection_type, docker_container, enabled, sort_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name.trim(),
-      hostname.trim(),
-      user?.trim() || null,
-      port || 22,
-      identity_file?.trim() || null,
-      auth_method || 'key',
-      group_name?.trim() || 'Other',
-      is_local ? 1 : 0,
+      resolvedHostname,
+      connectionType === 'docker' ? null : (user?.trim() || null),
+      connectionType === 'docker' ? 0 : (port || 22),
+      connectionType === 'docker' ? null : (identity_file?.trim() || null),
+      connectionType === 'docker' ? 'docker' : (auth_method || 'key'),
+      group_name?.trim() || (connectionType === 'docker' ? 'Docker' : 'Other'),
+      connectionType === 'docker' ? 0 : (is_local ? 1 : 0),
+      connectionType,
+      containerName,
       enabled !== false ? 1 : 0,
       nextSort
     );
@@ -198,7 +296,10 @@ export default async function managedHostsRoutes(fastify) {
     const existing = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
     if (!existing) return reply.code(404).send({ error: 'Host not found' });
 
-    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled } = request.body;
+    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container } = request.body;
+    const connectionType = connection_type === 'docker' ? 'docker' : (connection_type || existing.connection_type || 'ssh');
+    const containerName = docker_container?.trim() || existing.docker_container || null;
+    const resolvedHostname = connectionType === 'docker' ? containerName : (hostname?.trim() ?? existing.hostname);
 
     // Check for name collision with other hosts
     if (name && name.trim() !== existing.name) {
@@ -209,18 +310,20 @@ export default async function managedHostsRoutes(fastify) {
     db.prepare(`
       UPDATE managed_hosts SET
         name = ?, hostname = ?, user = ?, port = ?, identity_file = ?,
-        auth_method = ?, group_name = ?, is_local = ?, enabled = ?,
+        auth_method = ?, group_name = ?, is_local = ?, connection_type = ?, docker_container = ?, enabled = ?,
         updated_at = datetime('now')
       WHERE id = ?
     `).run(
       name?.trim() ?? existing.name,
-      hostname?.trim() ?? existing.hostname,
-      user?.trim() ?? existing.user,
-      port ?? existing.port,
-      identity_file?.trim() ?? existing.identity_file,
-      auth_method ?? existing.auth_method,
+      resolvedHostname,
+      connectionType === 'docker' ? null : (user?.trim() ?? existing.user),
+      connectionType === 'docker' ? 0 : (port ?? existing.port),
+      connectionType === 'docker' ? null : (identity_file?.trim() ?? existing.identity_file),
+      connectionType === 'docker' ? 'docker' : (auth_method ?? existing.auth_method),
       group_name?.trim() ?? existing.group_name,
-      is_local !== undefined ? (is_local ? 1 : 0) : existing.is_local,
+      connectionType === 'docker' ? 0 : (is_local !== undefined ? (is_local ? 1 : 0) : existing.is_local),
+      connectionType,
+      connectionType === 'docker' ? containerName : null,
       enabled !== undefined ? (enabled ? 1 : 0) : existing.enabled,
       existing.id
     );
@@ -299,6 +402,25 @@ export default async function managedHostsRoutes(fastify) {
     `).run(result.status, result.tmuxAvailable ? 1 : 0, host.id);
 
     return result;
+  });
+
+  // Install tmux on a reachable host after user confirmation in the UI
+  fastify.post('/api/managed-hosts/:id/install-tmux', async (request, reply) => {
+    const host = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
+    if (!host) return reply.code(404).send({ error: 'Host not found' });
+
+    try {
+      const result = await installTmux(host);
+      db.prepare(`
+        UPDATE managed_hosts SET
+          last_test_status = ?, last_test_at = datetime('now'), tmux_available = ?,
+          updated_at = datetime('now')
+        WHERE id = ?
+      `).run(result.test.status, result.test.tmuxAvailable ? 1 : 0, host.id);
+      return result;
+    } catch (err) {
+      return reply.code(err.statusCode || 500).send({ error: err.message });
+    }
   });
 
   // Test all enabled hosts in parallel

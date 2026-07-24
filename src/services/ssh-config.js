@@ -1,6 +1,6 @@
 // src/services/ssh-config.js — Parse ~/.ssh/config into structured host entries
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -32,7 +32,7 @@ const DEFAULT_GROUPS = {
  */
 export function parseSSHConfig(configPath) {
   const filePath = configPath || join(homedir(), '.ssh', 'config');
-  const content = readFileSync(filePath, 'utf8');
+  const content = existsSync(filePath) ? readFileSync(filePath, 'utf8') : '';
   const lines = content.split('\n');
 
   const hosts = [];

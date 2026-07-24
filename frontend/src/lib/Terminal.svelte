@@ -6,8 +6,13 @@
   import { ClipboardAddon } from '@xterm/addon-clipboard';
   import { Unicode11Addon } from '@xterm/addon-unicode11';
   import { subscribeStatus } from './stores/status.js';
+  import { translate } from './i18n.js';
 
-  let { session = 'main', host = 'reliant', focused = false, zoomed = false, sessionType = 'terminal', sessionTypeColor = '#6b7688', sessionTypeLabel = 'TERM', sessionContext = null, paneTitle = null, onSessionClick = null, onZoom = null, onSplit = null, onClose = null, onDragStart = null, onContextMenu = null, isMobile = false, onCtrlConsumed = null } = $props();
+  let { session = 'main', host = 'reliant', focused = false, zoomed = false, sessionType = 'terminal', sessionTypeColor = '#6b7688', sessionTypeLabel = 'TERM', sessionContext = null, paneTitle = null, onSessionClick = null, onZoom = null, onSplit = null, onClose = null, onDragStart = null, onContextMenu = null, isMobile = false, onCtrlConsumed = null, language = 'en' } = $props();
+
+  function t(key, params = {}) {
+    return translate(language, key, params);
+  }
 
   // When true, the next typed character is transformed into a control char
   // (set by the mobile key bar's sticky Ctrl). Cleared after one keystroke.
@@ -17,21 +22,21 @@
   let term;
   let fitAddon;
   let ws;
-  let reconnectTimer;
   let resizeTimer;
   let lastCols = 0;
   let lastRows = 0;
   let lastResizeTime = 0;
   let suppressResize = false;
   let suppressTimer;
-  let prevSession = $state(session);
-  let prevHost = $state(host);
+  let prevSession;
+  let prevHost;
   let connected = $state(false);
   let connecting = $state(false);
   let error = $state(null);
   let initError = $state(null); // visible message if xterm fails to initialize
   let paneStatus = $state(null); // { status, prevStatus, confidence }
   let unsubStatus;
+  let scrollbackCleanup;
 
   // Status badge config
   const STATUS_CONFIG = {
@@ -72,9 +77,9 @@
       ws.onclose = (event) => {
         connected = false;
         connecting = false;
-        if (event.code !== 1000) {
-          error = 'Disconnected';
-          reconnectTimer = setTimeout(() => connect(), 2000);
+        ws = null;
+        if (event.code !== 1000 || event.reason) {
+          error = event.reason || `Disconnected (${event.code})`;
         }
       };
 
@@ -110,7 +115,6 @@
   }
 
   function disconnect() {
-    clearTimeout(reconnectTimer);
     clearTimeout(resizeTimer);
     clearTimeout(suppressTimer);
     if (ws) {
@@ -120,6 +124,12 @@
     }
     connected = false;
     connecting = false;
+  }
+
+  function reconnectTerminal() {
+    disconnect();
+    error = null;
+    connect();
   }
 
   function sendResize() {
@@ -138,6 +148,9 @@
   }
 
   onMount(() => {
+    prevSession = session;
+    prevHost = host;
+
     const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
     // Create a fresh Terminal + addons. Called again if a failed open() left a
@@ -146,6 +159,7 @@
     function createTerm() {
       term = new Terminal({
         allowProposedApi: true,
+        alternateScrollMode: false,
         cursorBlink: true,
         cursorStyle: 'block',
         fontSize: isMobile ? 11 : 13,
@@ -241,8 +255,81 @@
         }
       }
 
+      installScrollbackHandlers();
       wireInput();
       connect();
+    }
+
+    function installScrollbackHandlers() {
+      scrollbackCleanup?.();
+
+      const lineHeight = () => {
+        const rowsEl = containerEl?.querySelector('.xterm-rows');
+        const rowEl = rowsEl?.firstElementChild;
+        const measured = rowEl?.getBoundingClientRect?.().height || 0;
+        return measured || (term.options.fontSize * term.options.lineHeight) || 16;
+      };
+
+      const scrollByPixels = (deltaY) => {
+        if (!term || !deltaY) return;
+        const lines = Math.trunc(deltaY / lineHeight()) || (deltaY > 0 ? 1 : -1);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'scroll', lines }));
+          return;
+        }
+        term.scrollLines(lines);
+      };
+
+      const onWheel = (event) => {
+        if (Math.abs(event.deltaY) < Math.abs(event.deltaX)) return;
+        const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? lineHeight()
+          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? lineHeight() * term.rows
+            : 1;
+        scrollByPixels(event.deltaY * unit);
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      term.attachCustomWheelEventHandler((event) => {
+        onWheel(event);
+        return false;
+      });
+
+      let lastTouchY = null;
+      const onTouchStart = (event) => {
+        if (event.touches.length !== 1) {
+          lastTouchY = null;
+          return;
+        }
+        lastTouchY = event.touches[0].clientY;
+      };
+      const onTouchMove = (event) => {
+        if (event.touches.length !== 1 || lastTouchY === null) return;
+        const nextY = event.touches[0].clientY;
+        scrollByPixels(lastTouchY - nextY);
+        lastTouchY = nextY;
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      const onTouchEnd = () => {
+        lastTouchY = null;
+      };
+
+      containerEl.addEventListener('wheel', onWheel, { capture: true, passive: false });
+      containerEl.addEventListener('touchstart', onTouchStart, { capture: true, passive: false });
+      containerEl.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
+      containerEl.addEventListener('touchend', onTouchEnd, { capture: true });
+      containerEl.addEventListener('touchcancel', onTouchEnd, { capture: true });
+
+      scrollbackCleanup = () => {
+        containerEl.removeEventListener('wheel', onWheel, { capture: true });
+        containerEl.removeEventListener('touchstart', onTouchStart, { capture: true });
+        containerEl.removeEventListener('touchmove', onTouchMove, { capture: true });
+        containerEl.removeEventListener('touchend', onTouchEnd, { capture: true });
+        containerEl.removeEventListener('touchcancel', onTouchEnd, { capture: true });
+        scrollbackCleanup = null;
+      };
     }
 
     // Attach xterm input handlers (clipboard shortcuts + data → WebSocket).
@@ -322,6 +409,7 @@
   });
 
   onDestroy(() => {
+    scrollbackCleanup?.();
     disconnect();
     if (term) {
       term.dispose();
@@ -345,6 +433,8 @@
 <div class="term-pane" class:focused class:zoomed>
   <div
     class="pane-hdr"
+    role="toolbar"
+    tabindex="0"
     draggable="true"
     ondragstart={(e) => {
       e.dataTransfer.setData('text/plain', session);
@@ -358,7 +448,7 @@
     }}
   >    <span class="dot" style="background:{sessionTypeColor};box-shadow:0 0 6px {sessionTypeColor}"></span>
     {#if onSessionClick}
-      <button class="sname clickable" onclick={(e) => { e.stopPropagation(); onSessionClick(); }} title="Click to change session">{paneTitle || session}</button>
+      <button class="sname clickable" onclick={(e) => { e.stopPropagation(); onSessionClick(); }} title={t('clickChangeSession')}>{paneTitle || session}</button>
     {:else}
       <span class="sname">{paneTitle || session}</span>
     {/if}
@@ -368,7 +458,7 @@
     <span class="hname">{host}</span>
     <span class="spacer"></span>
     {#if focused}
-      <span class="fbadge">FOCUSED</span>
+      <span class="fbadge">{language === 'zh-CN' ? '聚焦' : 'FOCUSED'}</span>
     {/if}
     {#if connecting}
       <span class="conn-badge connecting">CONNECTING</span>
@@ -376,6 +466,9 @@
       <span class="conn-badge connected">LIVE</span>
     {:else if error}
       <span class="conn-badge error">{error}</span>
+      <button class="conn-retry" title={t('reconnect')} onclick={(e) => { e.stopPropagation(); reconnectTerminal(); }}>
+        {t('reconnect')}
+      </button>
     {/if}
     {#if paneStatus && STATUS_CONFIG[paneStatus.status]}
       {@const cfg = STATUS_CONFIG[paneStatus.status]}
@@ -383,16 +476,16 @@
     {/if}
     <span class="tbadge" style="background:{sessionTypeColor}20;color:{sessionTypeColor}">{sessionTypeLabel}</span>
     <div class="pane-actions">
-      <button class="pane-act split-btn" title="Split left | right" onclick={(e) => { e.stopPropagation(); onSplit?.('h'); }}>
+      <button class="pane-act split-btn" title={t('splitLeftRightTitle')} onclick={(e) => { e.stopPropagation(); onSplit?.('h'); }}>
         <span class="split-icon-h"></span>
       </button>
-      <button class="pane-act split-btn" title="Split top / bottom" onclick={(e) => { e.stopPropagation(); onSplit?.('v'); }}>
+      <button class="pane-act split-btn" title={t('splitTopBottomTitle')} onclick={(e) => { e.stopPropagation(); onSplit?.('v'); }}>
         <span class="split-icon-v"></span>
       </button>
-      <button class="pane-act zoom-btn" title="{zoomed ? 'Restore' : 'Zoom'}" onclick={(e) => { e.stopPropagation(); onZoom?.(); }}>
+      <button class="pane-act zoom-btn" title={zoomed ? t('restore') : t('zoom')} onclick={(e) => { e.stopPropagation(); onZoom?.(); }}>
         <span class="zoom-icon" class:restore={zoomed}></span>
       </button>
-      <button class="pane-act close-act" title="Close pane" onclick={(e) => { e.stopPropagation(); onClose?.(); }}>
+      <button class="pane-act close-act" title={t('closePane')} onclick={(e) => { e.stopPropagation(); onClose?.(); }}>
         <span class="close-icon"></span>
       </button>
     </div>
@@ -400,6 +493,14 @@
   <div class="term-container" bind:this={containerEl}>
     {#if initError}
       <div class="init-error">{initError}</div>
+    {:else if error && !connected && !connecting}
+      <div class="terminal-error-panel">
+        <div class="terminal-error-title">{t('connectionError')}</div>
+        <div class="terminal-error-message">{error}</div>
+        <button class="conn-retry panel" onclick={(e) => { e.stopPropagation(); reconnectTerminal(); }}>
+          {t('reconnect')}
+        </button>
+      </div>
     {/if}
   </div>
 </div>
@@ -455,6 +556,18 @@
   .conn-badge.connected { background: rgba(127,217,98,0.1); color: #7fd962; }
   .conn-badge.connecting { background: rgba(255,180,84,0.1); color: #ffb454; }
   .conn-badge.error { background: rgba(240,113,120,0.1); color: #f07178; }
+  .conn-retry {
+    font-size: 9px; padding: 1px 6px; border-radius: 3px;
+    border: 1px solid rgba(240,113,120,0.25);
+    background: rgba(240,113,120,0.08); color: #f07178;
+    cursor: pointer; font-family: 'DM Sans', sans-serif;
+  }
+  .conn-retry:hover { background: rgba(240,113,120,0.15); }
+  .conn-retry.panel {
+    align-self: flex-start;
+    margin-top: 4px;
+    padding: 5px 10px;
+  }
 
   .status-badge {
     font-size: 9px; padding: 1px 6px; border-radius: 3px; font-weight: 600;
@@ -539,10 +652,39 @@
     flex: 1;
     padding: 4px;
     overflow: hidden;
+    position: relative;
   }
   .init-error {
     color: #f07178; font-size: 12px; font-family: 'JetBrains Mono', monospace;
     padding: 10px; line-height: 1.5;
+  }
+  .terminal-error-panel {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 8px;
+    padding: 18px;
+    background: rgba(11,14,17,0.92);
+    z-index: 3;
+    pointer-events: auto;
+  }
+  .terminal-error-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: #f07178;
+    text-transform: uppercase;
+    letter-spacing: 0;
+  }
+  .terminal-error-message {
+    max-width: 100%;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    color: #c5cdd9;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   /* xterm.js base styles */

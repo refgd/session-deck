@@ -1,22 +1,12 @@
-// src/routes/hosts.js — SSH hosts API (reads from managed_hosts table)
+// src/routes/hosts.js — hosts API (reads from managed_hosts table)
+
+import { getManagedHosts } from '../services/hosts.js';
 
 export default async function hostsRoutes(fastify) {
   const db = fastify.db;
 
   fastify.get('/api/hosts', async () => {
-    const hosts = db.prepare(
-      'SELECT * FROM managed_hosts WHERE enabled = 1 ORDER BY sort_order, name'
-    ).all();
-
-    // Map to the shape the frontend expects
-    const mapped = hosts.map(h => ({
-      name: h.name,
-      hostname: h.hostname,
-      user: h.user,
-      identityFile: h.identity_file,
-      group: h.group_name,
-      isLocal: !!h.is_local,
-    }));
+    const mapped = getManagedHosts(db);
 
     const groups = {};
     for (const host of mapped) {

@@ -83,6 +83,8 @@ function migrate(db) {
       auth_method TEXT NOT NULL DEFAULT 'key',
       group_name TEXT NOT NULL DEFAULT 'Other',
       is_local INTEGER NOT NULL DEFAULT 0,
+      connection_type TEXT NOT NULL DEFAULT 'ssh',
+      docker_container TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
       sort_order INTEGER NOT NULL DEFAULT 0,
       last_test_status TEXT,
@@ -106,6 +108,15 @@ function migrate(db) {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS app_users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_login_at TEXT
+    );
   `);
 
   // Migration: add sort_order if missing (for existing DBs)
@@ -113,6 +124,18 @@ function migrate(db) {
     db.prepare('SELECT sort_order FROM layout_presets LIMIT 1').get();
   } catch {
     db.exec('ALTER TABLE layout_presets ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0');
+  }
+
+  try {
+    db.prepare('SELECT connection_type FROM managed_hosts LIMIT 1').get();
+  } catch {
+    db.exec("ALTER TABLE managed_hosts ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'ssh'");
+  }
+
+  try {
+    db.prepare('SELECT docker_container FROM managed_hosts LIMIT 1').get();
+  } catch {
+    db.exec('ALTER TABLE managed_hosts ADD COLUMN docker_container TEXT');
   }
 
   // Seed default session types if empty

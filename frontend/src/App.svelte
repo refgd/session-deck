@@ -3,7 +3,14 @@
   import SplitPane from './lib/SplitPane.svelte';
   import Terminal from './lib/Terminal.svelte';
   import MobileKeyBar from './lib/MobileKeyBar.svelte';
-  import { countPanes, presets, leaf, removePane, splitPaneAt, getSessionNames, getSessionPanes, getSessionPanesWithPaths, movePane, applySessionsToTemplate } from './lib/stores/layout.js';
+  import Modal from './lib/Modal.svelte';
+  import SettingsDropdown from './lib/SettingsDropdown.svelte';
+  import HelpSection from './lib/HelpSection.svelte';
+  import CommandPalette from './lib/CommandPalette.svelte';
+  import SessionPicker from './lib/SessionPicker.svelte';
+  import PropertiesPanel from './lib/PropertiesPanel.svelte';
+  import { languages, normalizeLanguage, translate } from './lib/i18n.js';
+  import { countPanes, presets, leaf, removePane, splitPaneAt, getSessionNames, getSessionPanes, getSessionPanesWithPaths, movePane, applySessionsToTemplate, autoArrangeLayout } from './lib/stores/layout.js';
   import {
     loadWorkspaces, getWorkspaces, getActiveId, getActiveWorkspace,
     setActive, updateLayout, subscribe, updatePaneSession,
@@ -20,10 +27,12 @@
   let focusedId = $state(null);
   let loading = $state(true);
   let showSessionPicker = $state(null);
+  let pendingSessionPath = $state(null);
   let showPropsPanel = $state(false);
   let zoomedPane = $state(null); // { id, session, host } when a pane is zoomed
   let activitySet = $state(new Set()); // workspace IDs with unseen output
   let statusMap = $state({}); // "host:session" → { status, ... } from status WebSocket
+  let language = $state('en');
 
   // Mobile/responsive state
   let isMobile = $state(false);
@@ -49,7 +58,6 @@
   // Workspace management modals
   let showNewWsModal = $state(false);
   let newWsName = $state('');
-  let newWsPreset = $state('quad');
   let showRenameModal = $state(null);
   let renameValue = $state('');
   let showDeleteConfirm = $state(null);
@@ -83,12 +91,20 @@
   let managedHosts = $state([]);
   let managedHostsLoading = $state(false);
   let hostEditMode = $state(null); // null | 'add' | host.id (editing)
-  let hostForm = $state({ name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true });
+  let hostForm = $state({ name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true, connection_type: 'ssh', docker_container: '' });
   let hostDeleteConfirm = $state(null); // host id
+  let dockerContainers = $state([]);
+  let dockerContainersLoading = $state(false);
+  let sshKeys = $state([]);
+  let sshKeysLoading = $state(false);
+  let showAddKeyForm = $state(false);
+  let sshKeyForm = $state({ name: '', privateKey: '', publicKey: '' });
 
   // Settings session management
   let settingsSessionTab = $state('list'); // 'list' | 'create'
   let settingsSessionHostFilter = $state(null); // null = all, or host name
+  let sessionHostErrors = $state({}); // { [hostName]: error }
+  let sessionHostLoading = $state({}); // { [hostName]: true }
 
   // Appearance / theming
   let sessionTypes = $state([]); // from /api/session-types
@@ -128,6 +144,16 @@
     setTimeout(() => { toasts = toasts.filter(t => t.id !== id); }, duration);
   }
 
+  function t(key, params = {}) {
+    return translate(language, key, params);
+  }
+
+  function setLanguage(nextLanguage) {
+    language = normalizeLanguage(nextLanguage);
+    localStorage.setItem('session-deck-language', language);
+    document.documentElement.lang = language;
+  }
+
   subscribe(({ workspaces: ws, activeId: id }) => {
     workspaces = ws;
     activeId = id;
@@ -155,9 +181,9 @@
     const d = new Date(ts);
     const now = new Date();
     const diff = now - d;
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    if (diff < 3600000) return t('minutesAgo', { count: Math.floor(diff / 60000) });
+    if (diff < 86400000) return t('hoursAgo', { count: Math.floor(diff / 3600000) });
+    return d.toLocaleDateString(language === 'zh-CN' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 
   function typeLabel(type) {
@@ -237,6 +263,7 @@
   }
 
   function applyAccentColor(color) {
+    if (!/^#[0-9a-fA-F]{6}$/.test(String(color || ''))) return;
     const el = document.querySelector('.app');
     if (!el) return;
     el.style.setProperty('--accent', color);
@@ -365,10 +392,14 @@
 
   async function loadSessions() {
     try {
+      sessionHostErrors = {};
       // Load local sessions first (fast), then remote hosts in background
-      const localRes = await fetch('/api/sessions/reliant');
-      const localData = await localRes.json();
-      sessions = (localData.sessions || []).map(s => ({ ...s, host: 'reliant' }));
+      try {
+        sessions = await fetchHostSessions('reliant');
+      } catch (e) {
+        sessionHostErrors = { ...sessionHostErrors, reliant: e.message || 'Connection failed' };
+        sessions = [];
+      }
 
       // Load hosts list (for session manager host picker)
       const hostsRes = await fetch('/api/hosts');
@@ -380,11 +411,11 @@
         Promise.allSettled(
           remoteHosts.map(async (h) => {
             try {
-              const res = await fetch(`/api/sessions/${h.name}`);
-              if (!res.ok) return [];
-              const data = await res.json();
-              return (data.sessions || []).map(s => ({ ...s, host: h.name }));
-            } catch { return []; }
+              return await fetchHostSessions(h.name);
+            } catch (e) {
+              sessionHostErrors = { ...sessionHostErrors, [h.name]: e.message || 'Connection failed' };
+              return [];
+            }
           })
         ).then(results => {
           const remoteSessions = results
@@ -398,6 +429,50 @@
     } catch (e) {
       console.error('Failed to load sessions:', e);
     }
+  }
+
+  async function retrySessionHost(hostName) {
+    sessionHostLoading = { ...sessionHostLoading, [hostName]: true };
+    try {
+      const hostSessions = await fetchHostSessions(hostName);
+      sessions = [...sessions.filter(s => (s.host || 'reliant') !== hostName), ...hostSessions];
+      const { [hostName]: _removed, ...rest } = sessionHostErrors;
+      sessionHostErrors = rest;
+    } catch (e) {
+      sessions = sessions.filter(s => (s.host || 'reliant') !== hostName);
+      sessionHostErrors = { ...sessionHostErrors, [hostName]: e.message || 'Connection failed' };
+    } finally {
+      sessionHostLoading = { ...sessionHostLoading, [hostName]: false };
+    }
+  }
+
+  async function fetchHostSessions(hostName) {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(hostName)}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(formatSessionHostError(hostName, data, res));
+    if (data.status && data.status !== 'online') {
+      throw new Error(formatSessionHostError(hostName, data));
+    }
+    return (data.sessions || []).map(s => ({ ...s, host: hostName }));
+  }
+
+  function formatSessionHostError(hostName, data = {}, res = null) {
+    const parts = [];
+    const primary = data.message && data.message !== data.error ? data.message : data.error;
+    if (primary && primary !== 'Internal Server Error') parts.push(primary);
+    if (data.status && data.status !== 'online') parts.push(`status: ${data.status}`);
+    if (data.code) parts.push(`code: ${data.code}`);
+    if (data.syscall) parts.push(`syscall: ${data.syscall}`);
+    if (data.path) parts.push(`path: ${data.path}`);
+    if (data.host && data.host !== hostName) parts.push(`host: ${data.host}`);
+    if (res && !res.ok) parts.push(`HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}`);
+    if (parts.length === 0 && primary) parts.push(primary);
+    return parts.length > 0 ? parts.join(' | ') : 'Connection failed';
+  }
+
+  function hasVisibleSessionHostErrors() {
+    return Object.keys(sessionHostErrors)
+      .some(hostName => !settingsSessionHostFilter || settingsSessionHostFilter === hostName);
   }
 
   async function init() {
@@ -428,8 +503,6 @@
       }
     }
 
-    // Auto-refresh sessions every 30s
-    refreshTimer = setInterval(loadSessions, 30000);
   }
 
   function switchWorkspace(id) {
@@ -495,10 +568,7 @@
 
   function handleSplitPane(path, direction) {
     if (!activeLayout || !activeId) return;
-    // Pick the first unassigned session, or default to 'main'
-    const usedSessions = getSessionNames(activeLayout);
-    const availableSession = sessions.find(s => !usedSessions.includes(s.name))?.name || 'main';
-    const newLayout = splitPaneAt(activeLayout, path, direction, availableSession, 'reliant');
+    const newLayout = autoArrangeLayout(splitPaneAt(activeLayout, path, direction, null, 'reliant'));
     if (newLayout) {
       activeLayout = newLayout;
       // Force re-render
@@ -508,7 +578,7 @@
         activeId = tmp;
         updateLayout(tmp, newLayout);
       }, 50);
-      toast(`Split pane ${direction === 'h' ? 'horizontally' : 'vertically'}`, 'info');
+      toast('Pane added', 'info');
     }
   }
 
@@ -518,7 +588,8 @@
       toast("Can't close the last pane", 'error');
       return;
     }
-    const newLayout = removePane(activeLayout, path);
+    const removedLayout = removePane(activeLayout, path);
+    const newLayout = removedLayout ? autoArrangeLayout(removedLayout) : null;
     if (newLayout) {
       activeLayout = newLayout;
       focusedId = null;
@@ -556,12 +627,48 @@
   function assignSession(session) {
     if (showSessionPicker && activeId) {
       updatePaneSession(activeId, showSessionPicker.path, session.name, session.host || 'reliant');
+      focusedId = `${session.host || 'reliant'}:${session.name}`;
       showSessionPicker = null;
       // No need to cycle activeId — Terminal.svelte reacts to prop changes
     }
   }
 
   function closeSessionPicker() { showSessionPicker = null; }
+
+  function openCreateSessionForCurrentPicker() {
+    pendingSessionPath = showSessionPicker?.path || null;
+    closeSessionPicker();
+    openSessionManager();
+    settingsSessionTab = 'create';
+  }
+
+  function openSessionInCurrentPane(sessionName, hostName = 'reliant') {
+    if (!activeId || !activeLayout || !sessionName) {
+      toast('No active workspace', 'error');
+      return false;
+    }
+
+    const panes = getSessionPanesWithPaths(activeLayout);
+    if (panes.length === 0) {
+      toast('No pane available', 'error');
+      return false;
+    }
+
+    const pendingPane = pendingSessionPath
+      ? panes.find(p => p.path.join('.') === pendingSessionPath.join('.'))
+      : null;
+    const focusedPane = focusedId
+      ? panes.find(p => `${p.host || 'reliant'}:${p.session}` === focusedId)
+      : null;
+    const target = pendingPane || focusedPane || panes[0];
+    updatePaneSession(activeId, target.path, sessionName, hostName);
+    focusedId = `${hostName}:${sessionName}`;
+    pendingSessionPath = null;
+
+    const paneIndex = panes.findIndex(p => p.path.join('.') === target.path.join('.'));
+    if (paneIndex >= 0) mobileActivePane = paneIndex;
+    return true;
+  }
 
   // Context menu
   function openContextMenu(e, wsId) {
@@ -571,29 +678,13 @@
 
   function openNewWsModal() {
     newWsName = '';
-    newWsPreset = 'quad';
     showNewWsModal = true;
     contextMenu = null;
   }
 
   async function handleCreateWorkspace() {
     if (!newWsName.trim()) return;
-    const sessionNames = sessions.map(s => s.name);
-    const fallbackNames = sessionNames.length ? sessionNames : ['main', 'homelab', 'onsite', 'business'];
-
-    let layout;
-    // Check if a template is selected (prefixed with 'tpl:')
-    if (newWsPreset.startsWith('tpl:')) {
-      const tplId = parseInt(newWsPreset.slice(4), 10);
-      const tpl = templates.find(t => t.id === tplId);
-      if (tpl) {
-        layout = applySessionsToTemplate(tpl.layout, fallbackNames);
-      }
-    }
-    if (!layout) {
-      const layouts = presets(fallbackNames);
-      layout = layouts[newWsPreset] || layouts.quad;
-    }
+    const layout = leaf(null, 'reliant');
     try {
       await createWorkspace(newWsName.trim(), layout);
       showNewWsModal = false;
@@ -701,7 +792,7 @@
   }
 
   function settingsSectionTitle(section) {
-    const titles = { servers: 'Servers', sessions: 'Sessions', appearance: 'Appearance', help: 'Help' };
+    const titles = { servers: t('servers'), sessions: t('sessions'), appearance: t('appearance'), help: t('help') };
     return titles[section] || '';
   }
 
@@ -720,6 +811,59 @@
     }
   }
 
+  async function loadSshKeys() {
+    sshKeysLoading = true;
+    try {
+      const res = await fetch('/api/ssh-keys');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to load SSH keys');
+      sshKeys = data.keys || [];
+    } catch (e) {
+      sshKeys = [];
+      toast(e.message || 'Failed to load SSH keys', 'error');
+    } finally {
+      sshKeysLoading = false;
+    }
+  }
+
+  async function saveSshKey() {
+    if (!sshKeyForm.name.trim() || !sshKeyForm.privateKey.trim()) return;
+    sshKeysLoading = true;
+    try {
+      const res = await fetch('/api/ssh-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sshKeyForm),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to save SSH key');
+      sshKeyForm = { name: '', privateKey: '', publicKey: '' };
+      showAddKeyForm = false;
+      await loadSshKeys();
+      toast(`SSH key "${data.name}" saved`, 'success');
+    } catch (e) {
+      toast(e.message, 'error');
+    } finally {
+      sshKeysLoading = false;
+    }
+  }
+
+  async function deleteSshKey(name) {
+    sshKeysLoading = true;
+    try {
+      const res = await fetch(`/api/ssh-keys/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to delete SSH key');
+      if (hostForm.identity_file === data.path) hostForm.identity_file = '';
+      await loadSshKeys();
+      toast(`SSH key "${name}" deleted`, 'success');
+    } catch (e) {
+      toast(e.message, 'error');
+    } finally {
+      sshKeysLoading = false;
+    }
+  }
+
   async function autoImportIfEmpty() {
     const res = await fetch('/api/managed-hosts/count');
     const { count } = await res.json();
@@ -727,6 +871,7 @@
       await importSSHConfig();
     }
     await loadManagedHosts();
+    await loadSshKeys();
   }
 
   async function importSSHConfig() {
@@ -745,7 +890,8 @@
 
   function startAddHost() {
     hostEditMode = 'add';
-    hostForm = { name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true };
+    hostForm = { name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true, connection_type: 'ssh', docker_container: '' };
+    loadSshKeys();
   }
 
   function startEditHost(host) {
@@ -759,7 +905,11 @@
       auth_method: host.auth_method || 'key',
       group_name: host.group_name || 'Other',
       enabled: !!host.enabled,
+      connection_type: host.connection_type || (host.auth_method === 'docker' ? 'docker' : 'ssh'),
+      docker_container: host.docker_container || '',
     };
+    if (hostForm.connection_type === 'docker') loadDockerContainers();
+    else loadSshKeys();
   }
 
   function cancelHostEdit() {
@@ -767,8 +917,11 @@
   }
 
   async function saveHost() {
-    if (!hostForm.name.trim() || !hostForm.hostname.trim()) {
-      toast('Name and hostname are required', 'error');
+    const missingTarget = hostForm.connection_type === 'docker'
+      ? !hostForm.docker_container.trim()
+      : !hostForm.hostname.trim();
+    if (!hostForm.name.trim() || missingTarget) {
+      toast(hostForm.connection_type === 'docker' ? 'Name and container are required' : 'Name and hostname are required', 'error');
       return;
     }
     managedHostsLoading = true;
@@ -835,10 +988,47 @@
     });
   }
 
-  const HOST_GROUPS = ['Local', 'HomeLab LXC', 'HomeLab VM', 'Proxmox', 'NAS', 'VPS', 'Network', 'Client', 'Other'];
+  const HOST_GROUPS = ['Local', 'Docker', 'HomeLab LXC', 'HomeLab VM', 'Proxmox', 'NAS', 'VPS', 'Network', 'Client', 'Other'];
+
+  async function loadDockerContainers() {
+    dockerContainersLoading = true;
+    try {
+      const res = await fetch('/api/docker/containers');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to list Docker containers');
+      dockerContainers = data.containers || [];
+    } catch (e) {
+      dockerContainers = [];
+      toast(e.message || 'Failed to list Docker containers', 'error');
+    } finally {
+      dockerContainersLoading = false;
+    }
+  }
+
+  function setHostConnectionType(type) {
+    hostForm.connection_type = type;
+    if (type === 'docker') {
+      hostForm.group_name = 'Docker';
+      hostForm.user = '';
+      hostForm.port = 0;
+      hostForm.identity_file = '';
+      loadDockerContainers();
+    } else {
+      hostForm.port = hostForm.port || 22;
+      if (hostForm.group_name === 'Docker') hostForm.group_name = 'Other';
+    }
+  }
+
+  function selectDockerContainer(name) {
+    hostForm.docker_container = name;
+    hostForm.hostname = name;
+    if (!hostForm.name.trim()) hostForm.name = name;
+  }
 
   // Host test state
   let hostTesting = $state({}); // { [hostId]: true } while testing
+  let hostInstalling = $state({}); // { [hostId]: true } while installing tmux
+  let hostInstallConfirm = $state(null); // host object for tmux install confirmation
 
   async function testHost(id) {
     hostTesting = { ...hostTesting, [id]: true };
@@ -866,12 +1056,36 @@
     }
   }
 
+  async function installTmuxOnHost(host) {
+    if (!host) return;
+    hostInstalling = { ...hostInstalling, [host.id]: true };
+    try {
+      const res = await fetch(`/api/managed-hosts/${host.id}/install-tmux`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to install tmux');
+      managedHosts = managedHosts.map(h => h.id === host.id ? {
+        ...h,
+        last_test_status: data.test?.status || h.last_test_status,
+        last_test_at: new Date().toISOString(),
+        tmux_available: data.test?.tmuxAvailable ? 1 : 0,
+        _testResult: data.test,
+      } : h);
+      toast(data.alreadyInstalled ? `${host.name}: tmux already installed` : `${host.name}: tmux installed`, 'success');
+      await loadSessions();
+    } catch (e) {
+      toast(`Install failed: ${e.message}`, 'error');
+    } finally {
+      hostInstalling = { ...hostInstalling, [host.id]: false };
+      hostInstallConfirm = null;
+    }
+  }
+
   function managedHostsForSessions() {
     // Return hosts that are enabled and not network/client devices
     return managedHosts.filter(h => h.enabled && h.group_name !== 'Network' && h.group_name !== 'Client');
   }
 
-  function filteredSessionsByHost() {
+  function filteredSessionGroups() {
     const filtered = settingsSessionHostFilter
       ? sessions.filter(s => (s.host || 'reliant') === settingsSessionHostFilter)
       : sessions;
@@ -881,29 +1095,41 @@
       if (!grouped[h]) grouped[h] = [];
       grouped[h].push(s);
     }
+    for (const hostName of Object.keys(sessionHostErrors)) {
+      if (settingsSessionHostFilter && settingsSessionHostFilter !== hostName) continue;
+      if (!grouped[hostName]) grouped[hostName] = [];
+    }
     return Object.entries(grouped).sort(([a], [b]) => {
       if (a === 'reliant') return -1;
       if (b === 'reliant') return 1;
       return a.localeCompare(b);
-    });
+    }).map(([hostName, hostSessions]) => ({
+      hostName,
+      hostSessions,
+      error: sessionHostErrors[hostName],
+    }));
   }
 
   async function handleSettingsCreateSession() {
     if (!newSessionName.trim()) return;
     sessionMgrLoading = true;
+    const createdName = newSessionName.trim();
+    const createdHost = newSessionHost;
     try {
-      const res = await fetch(`/api/sessions/${newSessionHost}`, {
+      const res = await fetch(`/api/sessions/${createdHost}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newSessionName.trim(), startDir: newSessionDir.trim() || undefined }),
+        body: JSON.stringify({ name: createdName, startDir: newSessionDir.trim() || undefined }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to create session');
-      toast(`Created session "${newSessionName.trim()}" on ${newSessionHost}`, 'success');
       newSessionName = '';
       newSessionDir = '';
       settingsSessionTab = 'list';
       await loadSessions();
+      const opened = openSessionInCurrentPane(createdName, createdHost);
+      if (opened) closeSettingsPanel();
+      toast(opened ? `Created and opened session "${createdName}" on ${createdHost}` : `Created session "${createdName}" on ${createdHost}`, 'success');
     } catch (e) {
       toast(e.message, 'error');
     } finally {
@@ -974,35 +1200,35 @@
 
     // Workspace switching
     workspaces.forEach((ws, i) => {
-      cmds.push({ id: `ws-${ws.id}`, label: `Switch to workspace: ${ws.name}`, hint: `Alt+${i + 1}`, action: () => switchWorkspace(ws.id), category: 'Workspace' });
+      cmds.push({ id: `ws-${ws.id}`, label: `${t('switchWorkspace')}: ${ws.name}`, hint: `Alt+${i + 1}`, action: () => switchWorkspace(ws.id), category: t('currentWorkspace') });
     });
-    cmds.push({ id: 'ws-new', label: 'New workspace', hint: 'N', action: openNewWsModal, category: 'Workspace' });
+    cmds.push({ id: 'ws-new', label: t('newWorkspace'), hint: 'N', action: openNewWsModal, category: t('currentWorkspace') });
 
     // Pane actions
     if (focusedId) {
-      cmds.push({ id: 'zoom', label: zoomedPane ? 'Unzoom pane' : 'Zoom focused pane', hint: 'Ctrl+Shift+F', action: () => {
+      cmds.push({ id: 'zoom', label: zoomedPane ? t('restore') : t('zoomUnzoomPane'), hint: 'Ctrl+Shift+F', action: () => {
         if (zoomedPane) { zoomedPane = null; }
         else if (focusedId) {
           const [h, ...r] = focusedId.split(':');
           const s = r.join(':');
           if (s && !s.startsWith('split-')) handleZoom(focusedId, s, h);
         }
-      }, category: 'Pane' });
+      }, category: t('paneControl') });
     }
-    cmds.push({ id: 'props', label: showPropsPanel ? 'Hide properties panel' : 'Show properties panel', hint: 'I', action: () => showPropsPanel = !showPropsPanel, category: 'Pane' });
+    cmds.push({ id: 'props', label: t('toggleProperties'), hint: 'I', action: () => showPropsPanel = !showPropsPanel, category: t('paneControl') });
 
     // Session actions
     sessions.forEach(s => {
-      cmds.push({ id: `focus-${s.host}-${s.name}`, label: `Focus session: ${s.name}`, hint: s.host, action: () => { focusedId = `${s.host || 'reliant'}:${s.name}`; }, category: 'Session' });
+      cmds.push({ id: `focus-${s.host}-${s.name}`, label: `${t('sessions')}: ${s.name}`, hint: s.host, action: () => { focusedId = `${s.host || 'reliant'}:${s.name}`; }, category: t('sessions') });
     });
-    cmds.push({ id: 'session-mgr', label: 'Manage sessions', action: openSessionManager, category: 'Session' });
+    cmds.push({ id: 'session-mgr', label: t('manageSessions'), action: openSessionManager, category: t('sessions') });
 
     // Settings
-    cmds.push({ id: 'settings-servers', label: 'Settings: Servers', action: () => openSettingsSection('servers'), category: 'Settings' });
-    cmds.push({ id: 'settings-sessions', label: 'Settings: Sessions', action: () => openSettingsSection('sessions'), category: 'Settings' });
-    cmds.push({ id: 'settings-appearance', label: 'Settings: Appearance', action: () => openSettingsSection('appearance'), category: 'Settings' });
-    cmds.push({ id: 'settings-help', label: 'Settings: Help', action: () => openSettingsSection('help'), category: 'Settings' });
-    if (activeId) cmds.push({ id: 'save-template', label: 'Save workspace as template', action: () => saveAsTemplate(activeId), category: 'Workspace' });
+    cmds.push({ id: 'settings-servers', label: `${t('settings')}: ${t('servers')}`, action: () => openSettingsSection('servers'), category: t('settings') });
+    cmds.push({ id: 'settings-sessions', label: `${t('settings')}: ${t('sessions')}`, action: () => openSettingsSection('sessions'), category: t('settings') });
+    cmds.push({ id: 'settings-appearance', label: `${t('settings')}: ${t('appearance')}`, action: () => openSettingsSection('appearance'), category: t('settings') });
+    cmds.push({ id: 'settings-help', label: `${t('settings')}: ${t('help')}`, action: () => openSettingsSection('help'), category: t('settings') });
+    if (activeId) cmds.push({ id: 'save-template', label: t('saveAsTemplate'), action: () => saveAsTemplate(activeId), category: t('currentWorkspace') });
 
     return cmds;
   }
@@ -1269,6 +1495,9 @@
   }
 
   onMount(() => {
+    const savedLanguage = localStorage.getItem('session-deck-language') || navigator.language;
+    setLanguage(savedLanguage);
+
     window.addEventListener('keydown', handleKeydown);
     // Start activity polling for workspace badges
     const unsubActivity = subscribeActivity(set => { activitySet = set; });
@@ -1313,38 +1542,15 @@
   $effect(() => { init(); });
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="app" onclick={handleWindowClick}>
+<div class="app" role="presentation" onclick={handleWindowClick}>
   <nav class="topnav">
     <div class="logo-wrap">
-      <button class="logo" onclick={(e) => { e.stopPropagation(); toggleSettingsMenu(); }} title="Settings">
+      <button class="logo" onclick={(e) => { e.stopPropagation(); toggleSettingsMenu(); }} title={t('settings')}>
         <img class="logo-icon" src="/icon.svg" alt="" width="18" height="18" />
         <span class="logo-text">Session<b>Deck</b></span>
       </button>
       {#if showSettingsMenu}
-        <div class="settings-dropdown" onclick={(e) => e.stopPropagation()}>
-          <button class="settings-item" onclick={() => openSettingsSection('servers')}>
-            <span class="settings-icon servers-icon"></span>
-            Servers
-            <span class="settings-hint">Manage hosts</span>
-          </button>
-          <button class="settings-item" onclick={() => openSettingsSection('sessions')}>
-            <span class="settings-icon sessions-icon"></span>
-            Sessions
-            <span class="settings-hint">tmux sessions</span>
-          </button>
-          <div class="settings-sep"></div>
-          <button class="settings-item" onclick={() => openSettingsSection('appearance')}>
-            <span class="settings-icon appearance-icon"></span>
-            Appearance
-            <span class="settings-hint">Colors &amp; theme</span>
-          </button>
-          <button class="settings-item" onclick={() => openSettingsSection('help')}>
-            <span class="settings-icon help-icon"></span>
-            Help
-            <span class="settings-hint">Shortcuts &amp; docs</span>
-          </button>
-        </div>
+        <SettingsDropdown {language} onOpen={openSettingsSection} />
       {/if}
     </div>
     <span class="sep"></span>
@@ -1379,27 +1585,27 @@
     {/if}
     {#if authUser}
       <span class="auth-user">{authUser.name}</span>
-      <a class="auth-logout" href="/auth/logout" title="Sign out">Sign out</a>
+      <a class="auth-logout" href="/auth/logout" title={t('signOut')}>{t('signOut')}</a>
     {/if}
     {#if showViewToggle}
       <button
         class="topnav-btn view-toggle"
         onclick={() => viewMode = useSinglePane ? 'split' : 'single'}
-        title={useSinglePane ? 'Switch to split (multi-pane) view' : 'Switch to single-pane view'}
-      >{useSinglePane ? '▦ Split' : '▯ Single'}</button>
+        title={useSinglePane ? t('switchSplitView') : t('switchSingleView')}
+      >{useSinglePane ? `▦ ${t('split')}` : `▯ ${t('single')}`}</button>
     {/if}
     <button
       class="topnav-btn"
       class:active={showPropsPanel}
       onclick={() => showPropsPanel = !showPropsPanel}
-      title="Properties panel (I)"
+      title={`${t('properties')} (I)`}
     >{showPropsPanel ? 'I' : 'I'}</button>
   </nav>
 
   <div class="main-row">
     <main class="content">
       {#if loading}
-        <div class="center-msg">Loading workspaces...</div>
+        <div class="center-msg">{t('loadingWorkspaces')}</div>
       {:else if zoomedPane && activeId}
         <div class="zoomed-container">
           <Terminal
@@ -1410,6 +1616,7 @@
             sessionTypeColor={getTypeInfo(zoomedPane.session).color}
             sessionTypeLabel={getTypeInfo(zoomedPane.session).label}
             sessionContext={getTypeInfo(zoomedPane.session).context}
+            {language}
             onZoom={() => { zoomedPane = null; }}
             onSessionClick={() => openSessionPicker(zoomedPane.path || [], zoomedPane.session)}
             onContextMenu={(e) => handlePaneContextMenu(e, zoomedPane.path || [], zoomedPane.session, zoomedPane.host)}
@@ -1418,23 +1625,23 @@
       {:else if useSinglePane && activeLayout && activeId}
         {@const panes = getSessionPanesWithPaths(activeLayout)}
         {#if panes.length === 0}
-          <div class="center-msg">No panes</div>
+          <div class="center-msg">{t('noPanes')}</div>
         {:else if mobileMinimap}
           <!-- Mobile minimap: compact list view for portrait, efficient use of space -->
           <div class="minimap-container">
             {#each panes as pane, idx}
-              {@const status = getPaneStatusFromMap(pane.host, pane.session)}
+              {@const status = pane.session ? getPaneStatusFromMap(pane.host, pane.session) : null}
               {@const sc = STATUS_COLORS[status] || STATUS_COLORS.idle}
-              {@const info = getTypeInfo(pane.session)}
+              {@const info = pane.session ? getTypeInfo(pane.session) : { color: '#6b7688', label: 'EMPTY' }}
               <button
                 class="minimap-row"
                 class:asking={status === 'asking'}
                 style="border-left-color:{sc.border}"
                 onclick={() => openMinimapPane(idx)}
               >
-                <span class="minimap-row-left">
+                  <span class="minimap-row-left">
                   <span class="minimap-row-dot" style="background:{sc.border}"></span>
-                  <span class="minimap-row-session">{pane.session}</span>
+                  <span class="minimap-row-session">{pane.session || t('addSession')}</span>
                   <span class="minimap-row-host">{pane.host || 'reliant'}</span>
                 </span>
                 <span class="minimap-row-right">
@@ -1450,54 +1657,67 @@
           <!-- Mobile terminal: single pane with back button -->
           {#key `${activeId}-${mobileActivePane}`}
             {@const pane = panes[mobileActivePane % panes.length]}
-            {@const status = getPaneStatusFromMap(pane.host, pane.session)}
+            {@const status = pane.session ? getPaneStatusFromMap(pane.host, pane.session) : null}
             {@const sc = STATUS_COLORS[status] || STATUS_COLORS.idle}
             <div class="mobile-terminal">
               <div class="mobile-terminal-header">
-                <button class="mobile-back-btn" onclick={backToMinimap} title="Back to minimap">
-                  <span class="mobile-back-arrow">&#8592;</span> Minimap
+                <button class="mobile-back-btn" onclick={backToMinimap} title={t('backToMinimap')}>
+                  <span class="mobile-back-arrow">&#8592;</span> {t('minimap')}
                 </button>
                 <span class="mobile-terminal-info">
-                  <span class="mobile-terminal-name">{pane.session}</span>
+                  <span class="mobile-terminal-name">{pane.session || t('addSession')}</span>
                   {#if status && status !== 'idle' && status !== 'unknown'}
                     <span class="mobile-terminal-status" style="color:{sc.border}">{sc.label}</span>
                   {/if}
                 </span>
                 <div class="mobile-pane-switcher">
                   {#each panes as p, i}
-                    {@const pSt = getPaneStatusFromMap(p.host, p.session)}
+                    {@const pSt = p.session ? getPaneStatusFromMap(p.host, p.session) : null}
                     {@const pSc = STATUS_COLORS[pSt] || STATUS_COLORS.idle}
                     <button
                       class="mobile-pane-pip"
                       class:active={mobileActivePane === i}
                       style="background:{mobileActivePane === i ? pSc.border : pSc.dot}"
-                      title={p.session}
+                      title={p.session || t('addSession')}
                       onclick={() => mobileActivePane = i}
                     ></button>
                   {/each}
                 </div>
               </div>
               <div class="mobile-pane">
-                <Terminal
-                  bind:this={mobileTermRef}
-                  session={pane.session}
-                  host={pane.host}
-                  focused={true}
-                  isMobile={true}
-                  sessionTypeColor={getTypeInfo(pane.session).color}
-                  sessionTypeLabel={getTypeInfo(pane.session).label}
-                  sessionContext={getTypeInfo(pane.session).context}
-                  onSessionClick={() => openSessionPicker(pane.path, pane.session)}
-                  onContextMenu={(e) => handlePaneContextMenu(e, pane.path, pane.session, pane.host)}
-                  onCtrlConsumed={() => mobileKeyBarRef?.clearCtrl()}
-                />
+                {#if pane.session}
+                  <Terminal
+                    bind:this={mobileTermRef}
+                    session={pane.session}
+                    host={pane.host}
+                    focused={true}
+                    isMobile={true}
+                    sessionTypeColor={getTypeInfo(pane.session).color}
+                    sessionTypeLabel={getTypeInfo(pane.session).label}
+                    sessionContext={getTypeInfo(pane.session).context}
+                    {language}
+                    onSessionClick={() => openSessionPicker(pane.path, pane.session)}
+                    onContextMenu={(e) => handlePaneContextMenu(e, pane.path, pane.session, pane.host)}
+                    onCtrlConsumed={() => mobileKeyBarRef?.clearCtrl()}
+                  />
+                {:else}
+                  <div class="mobile-empty-pane">
+                    <button class="add-session-btn" onclick={() => openSessionPicker(pane.path, null)}>
+                      <span class="add-session-plus">+</span>
+                      <span>{t('addSession')}</span>
+                    </button>
+                  </div>
+                {/if}
               </div>
-              <MobileKeyBar
-                bind:this={mobileKeyBarRef}
-                onKey={(seq) => mobileTermRef?.sendInput(seq)}
-                onShowKeyboard={() => mobileTermRef?.focusTerminal()}
-                onCtrlToggle={(active) => mobileTermRef?.setCtrlPending(active)}
-              />
+              {#if pane.session}
+                <MobileKeyBar
+                  bind:this={mobileKeyBarRef}
+                  onKey={(seq) => mobileTermRef?.sendInput(seq)}
+                  onShowKeyboard={() => mobileTermRef?.focusTerminal()}
+                  onCtrlToggle={(active) => mobileTermRef?.setCtrlPending(active)}
+                  {language}
+                />
+              {/if}
             </div>
           {/key}
         {/if}
@@ -1516,157 +1736,185 @@
             onDrop={handlePaneDrop}
             onPaneContextMenu={handlePaneContextMenu}
             {getTypeInfo}
+            {language}
           />
         {/key}
       {:else}
-        <div class="center-msg">No workspaces configured</div>
+        <div class="center-msg">{t('noWorkspaces')}</div>
       {/if}
     </main>
 
     <!-- Properties panel -->
     {#if showPropsPanel}
-      <aside class="props-panel">
-        <div class="props-hdr">
-          <span class="props-title">Properties</span>
-          <button class="picker-close" onclick={() => showPropsPanel = false}>&times;</button>
-        </div>
-        {#if focusedId && getFocusedSession()}
-          {@const session = getFocusedSession()}
-          {@const host = getFocusedHost()}
-          <div class="props-body">
-            <div class="prop-section">
-              <div class="prop-session-name">
-                <span class="dot" style="background:{typeColor(session.type)};box-shadow:0 0 6px {typeColor(session.type)}"></span>
-                {session.name}
-              </div>
-              <span class="prop-type-badge" style="background:{typeColor(session.type)}20;color:{typeColor(session.type)}">{typeLabel(session.type)}</span>
-            </div>
-
-            <div class="prop-divider"></div>
-
-            <div class="prop-section">
-              <div class="prop-row">
-                <span class="prop-label">Host</span>
-                <span class="prop-value">{host}</span>
-              </div>
-              <div class="prop-row">
-                <span class="prop-label">Status</span>
-                <span class="prop-value">
-                  {#if session.attached}
-                    <span class="prop-badge attached">active</span>
-                  {:else}
-                    <span class="prop-badge detached">detached</span>
-                  {/if}
-                </span>
-              </div>
-              <div class="prop-row">
-                <span class="prop-label">Created</span>
-                <span class="prop-value">{formatTimestamp(session.created)}</span>
-              </div>
-              <div class="prop-actions">
-                <button class="prop-act-btn" onclick={() => openRenameSessionModal(session.name, host)}>Rename</button>
-                <button class="prop-act-btn danger" onclick={() => openDeleteSessionModal(session.name, host)}>Kill</button>
-              </div>
-            </div>
-
-            <div class="prop-divider"></div>
-
-            <div class="prop-section">
-              <span class="prop-section-title">Used in workspaces</span>
-              {#each getWorkspacesContaining(session.name) as ws}
-                <button
-                  class="prop-ws-link"
-                  class:current={ws.id === activeId}
-                  onclick={() => { switchWorkspace(ws.id); showPropsPanel = false; }}
-                  title="Switch to {ws.name}"
-                >
-                  {ws.name}
-                  {#if ws.id === activeId}<span class="prop-current-tag">current</span>{/if}
-                </button>
-              {:else}
-                <span class="prop-value dim">Not in any workspace</span>
-              {/each}
-            </div>
-
-
-            <div class="prop-divider"></div>
-
-            <div class="prop-section">
-              <span class="prop-section-title">Current workspace</span>
-              <div class="prop-row">
-                <span class="prop-label">Name</span>
-                <span class="prop-value">{activeName()}</span>
-              </div>
-              <div class="prop-row">
-                <span class="prop-label">Panes</span>
-                <span class="prop-value">{activeLayout ? countPanes(activeLayout) : 0}</span>
-              </div>
-            </div>
-          </div>
-        {:else}
-          <div class="props-empty">
-            <span class="props-empty-icon"></span>
-            <span>Click a pane to see details</span>
-          </div>
-        {/if}
-      </aside>
+      <PropertiesPanel
+        {language}
+        {activeId}
+        session={focusedId ? getFocusedSession() : null}
+        host={getFocusedHost()}
+        activeWorkspaceName={activeName()}
+        paneCount={activeLayout ? countPanes(activeLayout) : 0}
+        workspaces={focusedId && getFocusedSession() ? getWorkspacesContaining(getFocusedSession().name) : []}
+        {typeColor}
+        {typeLabel}
+        {formatTimestamp}
+        onClose={() => showPropsPanel = false}
+        onRename={openRenameSessionModal}
+        onDelete={openDeleteSessionModal}
+        onSwitchWorkspace={(id) => { switchWorkspace(id); showPropsPanel = false; }}
+      />
     {/if}
   </div>
 
   <!-- Settings panel (slide-over from left) -->
   {#if settingsSection}
-    <div class="settings-overlay" onclick={closeSettingsPanel}>
-      <div class="settings-panel" onclick={(e) => e.stopPropagation()}>
+    <div class="settings-overlay" role="dialog" aria-modal="true" aria-label={settingsSectionTitle(settingsSection)} tabindex="-1" onclick={closeSettingsPanel} onkeydown={(e) => e.key === 'Escape' && closeSettingsPanel()}>
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div class="settings-panel" role="document" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
         <div class="settings-panel-hdr">
-          <button class="settings-back" onclick={closeSettingsPanel}>
+          <button class="settings-back" aria-label={t('close')} title={t('close')} onclick={closeSettingsPanel}>
             <span class="back-arrow"></span>
           </button>
           <span class="settings-panel-title">{settingsSectionTitle(settingsSection)}</span>
-          <button class="picker-close" onclick={closeSettingsPanel}>&times;</button>
+          <button class="picker-close" aria-label={t('close')} title={t('close')} onclick={closeSettingsPanel}>&times;</button>
         </div>
         <div class="settings-panel-body">
           {#if settingsSection === 'servers'}
             <div class="host-mgr">
               <div class="host-mgr-toolbar">
-                <span class="host-mgr-count">{managedHosts.length} hosts</span>
+                <span class="host-mgr-count">{t('hostsCount', { count: managedHosts.length })}</span>
                 <span class="spacer"></span>
                 <button class="host-toolbar-btn" onclick={testAllHosts} disabled={managedHostsLoading || Object.values(hostTesting).some(Boolean)} title="Test connectivity on all enabled hosts">
-                  {Object.values(hostTesting).some(Boolean) ? 'Testing...' : 'Test All'}
+                  {Object.values(hostTesting).some(Boolean) ? t('testing') : t('testAll')}
                 </button>
                 <button class="host-toolbar-btn" onclick={importSSHConfig} disabled={managedHostsLoading} title="Re-import from ~/.ssh/config">
-                  Import SSH Config
+                  {t('importSshConfig')}
                 </button>
                 <button class="host-toolbar-btn primary" onclick={startAddHost} disabled={managedHostsLoading}>
-                  + Add Host
+                  {t('addHost')}
                 </button>
+              </div>
+
+              <div class="ssh-key-section">
+                <div class="ssh-key-header">
+                  <span class="appearance-section-title">{t('sshKeys')}</span>
+                  <span class="spacer"></span>
+                  <button class="host-toolbar-btn" onclick={loadSshKeys} disabled={sshKeysLoading}>
+                    {sshKeysLoading ? t('loading') : t('refresh')}
+                  </button>
+                  <button class="host-toolbar-btn primary" onclick={() => showAddKeyForm = !showAddKeyForm}>
+                    {showAddKeyForm ? t('cancel') : t('addSshKey')}
+                  </button>
+                </div>
+                {#if showAddKeyForm}
+                  <div class="ssh-key-form">
+                    <label class="host-field">
+                      <span class="host-field-label">{t('keyName')}</span>
+                      <input class="field-input" bind:value={sshKeyForm.name} placeholder="id_ed25519_prod" />
+                    </label>
+                    <label class="host-field full-width">
+                      <span class="host-field-label">{t('privateKey')}</span>
+                      <textarea class="field-input key-textarea" bind:value={sshKeyForm.privateKey} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+                    </label>
+                    <label class="host-field full-width">
+                      <span class="host-field-label">{t('publicKeyOptional')}</span>
+                      <input class="field-input" bind:value={sshKeyForm.publicKey} placeholder="ssh-ed25519 ..." />
+                    </label>
+                    <div class="host-form-actions">
+                      <button class="action-btn" onclick={saveSshKey} disabled={!sshKeyForm.name.trim() || !sshKeyForm.privateKey.trim() || sshKeysLoading}>
+                        {sshKeysLoading ? t('saving') : t('save')}
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+                <div class="ssh-key-list">
+                  {#each sshKeys as key}
+                    <div class="ssh-key-row">
+                      <span class="ssh-key-name">{key.name}</span>
+                      <span class="ssh-key-path">{key.path}</span>
+                      <span class="host-badge disabled-badge">{key.managed ? t('managed') : t('discovered')}</span>
+                      {#if key.managed}
+                        <button class="mgr-act danger" title={t('delete')} onclick={() => deleteSshKey(key.name)}>
+                          <span class="mgr-icon-delete"></span>
+                        </button>
+                      {/if}
+                    </div>
+                  {:else}
+                    <div class="host-empty compact">{t('noSshKeys')}</div>
+                  {/each}
+                </div>
               </div>
 
               {#if hostEditMode}
                 <div class="host-form">
-                  <div class="host-form-title">{hostEditMode === 'add' ? 'Add Host' : 'Edit Host'}</div>
+                  <div class="host-form-title">{hostEditMode === 'add' ? t('addHost') : t('editHost')}</div>
                   <div class="host-form-grid">
+                    <label class="host-field full-width">
+                      <span class="host-field-label">{t('connectionType')}</span>
+                      <div class="host-type-toggle">
+                        <button
+                          type="button"
+                          class="host-type-btn"
+                          class:active={hostForm.connection_type !== 'docker'}
+                          onclick={() => setHostConnectionType('ssh')}
+                        >SSH</button>
+                        <button
+                          type="button"
+                          class="host-type-btn"
+                          class:active={hostForm.connection_type === 'docker'}
+                          onclick={() => setHostConnectionType('docker')}
+                        >Docker</button>
+                      </div>
+                    </label>
                     <label class="host-field">
-                      <span class="host-field-label">Name *</span>
+                      <span class="host-field-label">{t('name')} *</span>
                       <input class="field-input" type="text" bind:value={hostForm.name} placeholder="my-server" />
                     </label>
+                    {#if hostForm.connection_type === 'docker'}
+                      <label class="host-field">
+                        <span class="host-field-label">{t('dockerContainer')} *</span>
+                        <select class="field-input" bind:value={hostForm.docker_container} onchange={(e) => selectDockerContainer(e.target.value)}>
+                          <option value="">{dockerContainersLoading ? t('loadingContainers') : t('selectContainer')}</option>
+                          {#each dockerContainers as c}
+                            <option value={c.name}>{c.name} ({c.image})</option>
+                          {/each}
+                        </select>
+                      </label>
+                      <label class="host-field full-width">
+                        <span class="host-field-label">{t('runningContainers')}</span>
+                        <div class="docker-container-actions">
+                          <button type="button" class="host-toolbar-btn" onclick={loadDockerContainers} disabled={dockerContainersLoading}>
+                            {dockerContainersLoading ? t('loadingContainers') : t('refreshContainers')}
+                          </button>
+                          {#if hostForm.docker_container}
+                            <span class="docker-selected">{hostForm.docker_container}</span>
+                          {/if}
+                        </div>
+                      </label>
+                    {:else}
+                      <label class="host-field">
+                        <span class="host-field-label">{t('hostnameIp')}</span>
+                        <input class="field-input" type="text" bind:value={hostForm.hostname} placeholder="192.168.1.100" />
+                      </label>
+                      <label class="host-field">
+                        <span class="host-field-label">{t('user')}</span>
+                        <input class="field-input" type="text" bind:value={hostForm.user} placeholder="claude" />
+                      </label>
+                      <label class="host-field">
+                        <span class="host-field-label">{t('port')}</span>
+                        <input class="field-input" type="number" bind:value={hostForm.port} />
+                      </label>
+                      <label class="host-field full-width">
+                        <span class="host-field-label">{t('identityFile')}</span>
+                        <select class="field-input" bind:value={hostForm.identity_file}>
+                          <option value="">{t('defaultSshKey')}</option>
+                          {#each sshKeys as key}
+                            <option value={key.path}>{key.name} - {key.path}</option>
+                          {/each}
+                        </select>
+                      </label>
+                    {/if}
                     <label class="host-field">
-                      <span class="host-field-label">Hostname / IP *</span>
-                      <input class="field-input" type="text" bind:value={hostForm.hostname} placeholder="192.168.1.100" />
-                    </label>
-                    <label class="host-field">
-                      <span class="host-field-label">User</span>
-                      <input class="field-input" type="text" bind:value={hostForm.user} placeholder="claude" />
-                    </label>
-                    <label class="host-field">
-                      <span class="host-field-label">Port</span>
-                      <input class="field-input" type="number" bind:value={hostForm.port} />
-                    </label>
-                    <label class="host-field full-width">
-                      <span class="host-field-label">Identity File</span>
-                      <input class="field-input" type="text" bind:value={hostForm.identity_file} placeholder="~/.ssh/id_ed25519" />
-                    </label>
-                    <label class="host-field">
-                      <span class="host-field-label">Group</span>
+                      <span class="host-field-label">{t('group')}</span>
                       <select class="field-input" bind:value={hostForm.group_name}>
                         {#each HOST_GROUPS as g}
                           <option value={g}>{g}</option>
@@ -1674,24 +1922,24 @@
                       </select>
                     </label>
                     <label class="host-field">
-                      <span class="host-field-label">Enabled</span>
+                      <span class="host-field-label">{t('enabled')}</span>
                       <label class="host-toggle">
                         <input type="checkbox" bind:checked={hostForm.enabled} />
-                        <span class="toggle-label">{hostForm.enabled ? 'Yes' : 'No'}</span>
+                        <span class="toggle-label">{hostForm.enabled ? t('yes') : t('no')}</span>
                       </label>
                     </label>
                   </div>
                   <div class="host-form-actions">
-                    <button class="action-btn secondary" onclick={cancelHostEdit}>Cancel</button>
-                    <button class="action-btn" onclick={saveHost} disabled={managedHostsLoading || !hostForm.name.trim() || !hostForm.hostname.trim()}>
-                      {managedHostsLoading ? 'Saving...' : (hostEditMode === 'add' ? 'Add Host' : 'Save Changes')}
+                    <button class="action-btn secondary" onclick={cancelHostEdit}>{t('cancel')}</button>
+                    <button class="action-btn" onclick={saveHost} disabled={managedHostsLoading || !hostForm.name.trim() || (hostForm.connection_type === 'docker' ? !hostForm.docker_container.trim() : !hostForm.hostname.trim())}>
+                      {managedHostsLoading ? t('saving') : (hostEditMode === 'add' ? t('addHost') : t('saveChanges'))}
                     </button>
                   </div>
                 </div>
               {/if}
 
               {#if managedHostsLoading && managedHosts.length === 0}
-                <div class="host-loading">Loading hosts...</div>
+                <div class="host-loading">{t('loadingHosts')}</div>
               {:else}
                 {#each managedHostsByGroup() as [groupName, groupHosts]}
                   <div class="host-group">
@@ -1702,49 +1950,52 @@
                           <span class="host-name">{h.name}</span>
                           <span class="host-addr">{h.user ? h.user + '@' : ''}{h.hostname}{h.port !== 22 ? ':' + h.port : ''}</span>
                           {#if h.is_local}
-                            <span class="host-badge local">local</span>
+                            <span class="host-badge local">{t('local')}</span>
+                          {/if}
+                          {#if h.connection_type === 'docker'}
+                            <span class="host-badge docker-badge">docker</span>
                           {/if}
                           {#if !h.enabled}
-                            <span class="host-badge disabled-badge">disabled</span>
+                            <span class="host-badge disabled-badge">{t('disabled')}</span>
                           {/if}
                           {#if hostTesting[h.id]}
-                            <span class="host-badge testing-badge">testing...</span>
+                            <span class="host-badge testing-badge">{t('testing')}</span>
                           {:else if h.last_test_status === 'ok'}
-                            <span class="host-badge ok-badge">reachable</span>
+                            <span class="host-badge ok-badge">{t('reachable')}</span>
                           {:else if h.last_test_status === 'error'}
-                            <span class="host-badge error-badge">unreachable</span>
+                            <span class="host-badge error-badge">{t('unreachable')}</span>
                           {/if}
                           {#if h.tmux_available === 1}
                             <span class="host-badge tmux-badge">tmux</span>
                           {:else if h.tmux_available === 0}
-                            <span class="host-badge no-tmux-badge">no tmux</span>
+                            <span class="host-badge no-tmux-badge">{t('noTmux')}</span>
                           {/if}
                         </div>
                         <div class="host-row-actions">
                           <button
                             class="mgr-act test-btn"
-                            title="Test connectivity"
+                            title={t('test')}
                             onclick={() => testHost(h.id)}
                             disabled={hostTesting[h.id]}
                           >
-                            {hostTesting[h.id] ? '...' : 'Test'}
+                            {hostTesting[h.id] ? '...' : t('test')}
                           </button>
                           <button
                             class="mgr-act test-btn"
-                            title="View sessions on this host"
+                            title={t('viewSessionsHost')}
                             onclick={() => { settingsSessionHostFilter = h.name; settingsSection = 'sessions'; settingsSessionTab = 'list'; }}
                           >
-                            Sessions
+                            {t('sessions')}
                           </button>
                           <button class="mgr-act" title="Edit" onclick={() => startEditHost(h)}>
                             <span class="mgr-icon-rename"></span>
                           </button>
                           {#if hostDeleteConfirm === h.id}
-                            <button class="mgr-act confirm-del" title="Confirm delete" onclick={() => deleteHost(h.id)}>
-                              Yes
+                            <button class="mgr-act confirm-del" title={t('confirmDelete')} onclick={() => deleteHost(h.id)}>
+                              {t('yes')}
                             </button>
-                            <button class="mgr-act" title="Cancel" onclick={() => hostDeleteConfirm = null}>
-                              No
+                            <button class="mgr-act" title={t('cancel')} onclick={() => hostDeleteConfirm = null}>
+                              {t('no')}
                             </button>
                           {:else}
                             <button class="mgr-act danger" title="Delete" onclick={() => hostDeleteConfirm = h.id}>
@@ -1757,10 +2008,17 @@
                         <div class="host-setup-hint">
                           <span class="host-setup-os">{h._testResult.os || 'Unknown OS'}</span>
                           {#if h._testResult.installCommand}
-                            <span class="host-setup-label">Install tmux:</span>
+                            <span class="host-setup-label">{t('installTmux')}</span>
                             <code class="host-setup-cmd">{h._testResult.installCommand}</code>
+                            <button
+                              class="host-setup-copy"
+                              onclick={() => hostInstallConfirm = h}
+                              disabled={hostInstalling[h.id]}
+                            >
+                              {hostInstalling[h.id] ? t('installing') : t('install')}
+                            </button>
                             <button class="host-setup-copy" onclick={() => { navigator.clipboard.writeText(h._testResult.installCommand); toast('Copied to clipboard', 'info'); }}>
-                              Copy
+                              {t('copy')}
                             </button>
                           {/if}
                         </div>
@@ -1774,8 +2032,8 @@
                   </div>
                 {:else}
                   <div class="host-empty">
-                    <span>No hosts configured</span>
-                    <button class="action-btn" onclick={importSSHConfig}>Import from SSH Config</button>
+                    <span>{t('noHostsConfigured')}</span>
+                    <button class="action-btn" onclick={importSSHConfig}>{t('importFromSshConfig')}</button>
                   </div>
                 {/each}
               {/if}
@@ -1783,10 +2041,13 @@
           {:else if settingsSection === 'sessions'}
             <div class="host-mgr">
               <div class="host-mgr-toolbar">
-                <span class="host-mgr-count">{sessions.length} sessions</span>
+                <span class="host-mgr-count">{t('sessionsCount', { count: sessions.length })}</span>
                 <span class="spacer"></span>
+                <button class="host-toolbar-btn" onclick={loadSessions}>
+                  {t('refresh')}
+                </button>
                 <button class="host-toolbar-btn primary" onclick={() => { settingsSessionTab = 'create'; }}>
-                  + New Session
+                  {t('newSession')}
                 </button>
               </div>
 
@@ -1796,7 +2057,7 @@
                   class="session-host-tab"
                   class:active={!settingsSessionHostFilter}
                   onclick={() => settingsSessionHostFilter = null}
-                >All Hosts</button>
+                >{t('allHosts')}</button>
                 {#each managedHostsForSessions() as h}
                   <button
                     class="session-host-tab"
@@ -1804,21 +2065,24 @@
                     onclick={() => settingsSessionHostFilter = h.name}
                   >{h.name}
                     <span class="session-host-cnt">{sessions.filter(s => (s.host || 'reliant') === h.name).length}</span>
+                    {#if sessionHostErrors[h.name]}
+                      <span class="session-host-error-dot"></span>
+                    {/if}
                   </button>
                 {/each}
               </div>
 
               {#if settingsSessionTab === 'create'}
                 <div class="host-form">
-                  <div class="host-form-title">New Session</div>
+                  <div class="host-form-title">{t('newSession')}</div>
                   <div class="host-form-grid">
                     <label class="host-field">
-                      <span class="host-field-label">Session Name *</span>
+                      <span class="host-field-label">{t('sessionName')}</span>
                       <input class="field-input" type="text" bind:value={newSessionName} placeholder="my-session"
                         onkeydown={(e) => e.key === 'Enter' && handleSettingsCreateSession()} />
                     </label>
                     <label class="host-field">
-                      <span class="host-field-label">Host</span>
+                      <span class="host-field-label">{t('host')}</span>
                       <select class="field-input" bind:value={newSessionHost}>
                         {#each managedHostsForSessions() as h}
                           <option value={h.name}>{h.name}</option>
@@ -1826,16 +2090,16 @@
                       </select>
                     </label>
                     <label class="host-field full-width">
-                      <span class="host-field-label">Start Directory <span class="field-hint">(optional)</span></span>
+                      <span class="host-field-label">{t('startDirectory')} <span class="field-hint">({t('optional')})</span></span>
                       <input class="field-input" type="text" bind:value={newSessionDir} placeholder="/home/user/project"
                         onkeydown={(e) => e.key === 'Enter' && handleSettingsCreateSession()} />
                     </label>
                   </div>
                   <div class="host-form-actions">
-                    <button class="action-btn secondary" onclick={() => { settingsSessionTab = 'list'; }}>Cancel</button>
+                    <button class="action-btn secondary" onclick={() => { settingsSessionTab = 'list'; }}>{t('cancel')}</button>
                     <button class="action-btn" onclick={handleSettingsCreateSession}
                       disabled={!newSessionName.trim() || sessionMgrLoading}>
-                      {sessionMgrLoading ? 'Creating...' : 'Create Session'}
+                      {sessionMgrLoading ? t('creating') : t('createSession')}
                     </button>
                   </div>
                 </div>
@@ -1844,28 +2108,42 @@
               <div class="mgr-legend">
                 <span class="mgr-legend-item"><span class="dot" style="background:{typeColor('claude')};box-shadow:0 0 6px {typeColor('claude')}"></span> Claude Code</span>
                 <span class="mgr-legend-item"><span class="dot" style="background:{typeColor('gsd')};box-shadow:0 0 6px {typeColor('gsd')}"></span> GSD / Auto</span>
-                <span class="mgr-legend-item"><span class="dot" style="background:{typeColor('bash')}"></span> Terminal</span>
+                <span class="mgr-legend-item"><span class="dot" style="background:{typeColor('bash')}"></span> {t('terminal')}</span>
               </div>
 
-              {#each filteredSessionsByHost() as [hostName, hostSessions]}
+              {#each filteredSessionGroups() as group}
                 <div class="mgr-host-group">
-                  <div class="mgr-host-label">{hostName}</div>
-                  {#each hostSessions as s}
+                  <div class="mgr-host-label">{group.hostName}</div>
+                  {#if group.error}
+                    <div class="session-host-error-row">
+                      <div class="session-host-error-main">
+                        <span class="session-host-error-title">{t('connectionError')}</span>
+                        <span class="session-host-error-message">{group.error}</span>
+                      </div>
+                      <button class="host-toolbar-btn" onclick={() => retrySessionHost(group.hostName)} disabled={sessionHostLoading[group.hostName]}>
+                        {sessionHostLoading[group.hostName] ? t('connecting') : t('reconnect')}
+                      </button>
+                    </div>
+                  {/if}
+                  {#each group.hostSessions as s}
                     <div class="mgr-session-row">
                       <span class="dot" style="background:{typeColor(s.type)};box-shadow:0 0 6px {typeColor(s.type)}"></span>
                       <span class="mgr-session-name">{s.name}</span>
                       <span class="mgr-session-meta">
                         {#if s.attached}
-                          <span class="prop-badge attached">active</span>
+                          <span class="prop-badge attached">{t('active')}</span>
                         {:else}
-                          <span class="prop-badge detached">detached</span>
+                          <span class="prop-badge detached">{t('detached')}</span>
                         {/if}
                       </span>
                       <div class="mgr-session-actions">
-                        <button class="mgr-act" title="Rename" onclick={() => openRenameSessionModal(s.name, hostName)}>
+                        <button class="mgr-act text-act" title={t('openSession')} onclick={() => openSessionInCurrentPane(s.name, group.hostName)}>
+                          {t('openSession')}
+                        </button>
+                        <button class="mgr-act" title="Rename" onclick={() => openRenameSessionModal(s.name, group.hostName)}>
                           <span class="mgr-icon-rename"></span>
                         </button>
-                        <button class="mgr-act danger" title="Kill session" onclick={() => openDeleteSessionModal(s.name, hostName)}>
+                        <button class="mgr-act danger" title="Kill session" onclick={() => openDeleteSessionModal(s.name, group.hostName)}>
                           <span class="mgr-icon-delete"></span>
                         </button>
                       </div>
@@ -1873,16 +2151,18 @@
                   {/each}
                 </div>
               {:else}
-                <div class="host-empty">
-                  <span>No sessions found{settingsSessionHostFilter ? ` on ${settingsSessionHostFilter}` : ''}</span>
-                </div>
+                {#if !hasVisibleSessionHostErrors()}
+                  <div class="host-empty">
+                    <span>{t('noSessionsFound', { suffix: settingsSessionHostFilter ? ` on ${settingsSessionHostFilter}` : '' })}</span>
+                  </div>
+                {/if}
               {/each}
             </div>
           {:else if settingsSection === 'appearance'}
             <div class="host-mgr">
               <!-- Accent Color -->
               <div class="appearance-section">
-                <div class="appearance-section-title">Accent Color</div>
+                <div class="appearance-section-title">{t('accentColor')}</div>
                 <div class="accent-picker">
                   {#each [
                     { color: '#F97316', label: 'Orange' },
@@ -1906,22 +2186,40 @@
                       type="color"
                       value={accentColor}
                       onchange={(e) => saveAccentColor(e.target.value)}
-                      title="Custom color"
+                      title={t('customColor')}
                     />
-                    <span class="accent-custom-label">Custom</span>
+                    <span class="accent-custom-label">{t('custom')}</span>
                   </label>
+                </div>
+              </div>
+
+              <div class="appearance-section">
+                <div class="appearance-section-title">{t('language')}</div>
+                <div class="language-options" role="radiogroup" aria-label={t('language')}>
+                  {#each languages as lang}
+                    <button
+                      class="language-option"
+                      class:active={language === lang.code}
+                      role="radio"
+                      aria-checked={language === lang.code}
+                      onclick={() => setLanguage(lang.code)}
+                    >
+                      <span class="language-short">{lang.shortLabel}</span>
+                      <span>{lang.code === 'zh-CN' ? t('chinese') : t('english')}</span>
+                    </button>
+                  {/each}
                 </div>
               </div>
 
               <!-- Session Type Colors -->
               <div class="appearance-section">
                 <div class="appearance-section-hdr">
-                  <span class="appearance-section-title">Session Type Colors</span>
+                  <span class="appearance-section-title">{t('sessionTypeColors')}</span>
                   <button class="host-toolbar-btn" onclick={scanSessionTypes} disabled={scanningTypes}>
-                    {scanningTypes ? 'Scanning...' : 'Scan Sessions'}
+                    {scanningTypes ? t('scanning') : t('scanSessions')}
                   </button>
                 </div>
-                <p class="appearance-desc">Colors are assigned by the process running in each tmux pane. Scan to discover new process types.</p>
+                <p class="appearance-desc">{t('sessionTypeDesc')}</p>
                 <div class="type-list">
                   {#each sessionTypes as t}
                     <div class="type-row">
@@ -1932,8 +2230,8 @@
                           onkeydown={(e) => e.key === 'Enter' && saveTypeEdit()} />
                         <span class="type-process">{t.process_name}</span>
                         <div class="type-row-actions">
-                          <button class="mgr-act" onclick={saveTypeEdit}>Save</button>
-                          <button class="mgr-act" onclick={() => editingTypeId = null}>Cancel</button>
+                          <button class="mgr-act" onclick={saveTypeEdit}>{t('save')}</button>
+                          <button class="mgr-act" onclick={() => editingTypeId = null}>{t('cancel')}</button>
                         </div>
                       {:else}
                         <span class="dot" style="background:{t.color};box-shadow:0 0 6px {t.color}"></span>
@@ -1952,75 +2250,12 @@
               </div>
             </div>
           {:else if settingsSection === 'help'}
-            <div class="help-section">
-              <div class="help-group">
-                <span class="help-group-title">Workspace Navigation</span>
-                <div class="help-row"><kbd>Alt+1</kbd>–<kbd>9</kbd><span>Switch workspace</span></div>
-                <div class="help-row"><kbd>N</kbd><span>New workspace</span></div>
-                <div class="help-row"><kbd>I</kbd><span>Toggle properties panel</span></div>
-              </div>
-              <div class="help-group">
-                <span class="help-group-title">Pane Control</span>
-                <div class="help-row"><kbd>Alt+Shift+1</kbd>–<kbd>9</kbd><span>Focus pane by index</span></div>
-                <div class="help-row"><kbd>Ctrl+Shift+F</kbd><span>Zoom / unzoom pane</span></div>
-                <div class="help-row"><kbd>Esc</kbd><span>Unzoom / close menu</span></div>
-              </div>
-              <div class="help-group">
-                <span class="help-group-title">Pane Actions (right-click)</span>
-                <div class="help-row"><span class="help-label">Change Session</span><span>Assign a different tmux session</span></div>
-                <div class="help-row"><span class="help-label">Split H / V</span><span>Split pane horizontally or vertically</span></div>
-                <div class="help-row"><span class="help-label">Close Pane</span><span>Remove pane from layout</span></div>
-              </div>
-              <div class="help-group">
-                <span class="help-group-title">Drag &amp; Drop</span>
-                <div class="help-row"><span class="help-label">Center drop</span><span>Swap two panes</span></div>
-                <div class="help-row"><span class="help-label">Edge drop</span><span>Split target in that direction</span></div>
-              </div>
-              <div class="help-group">
-                <span class="help-group-title">Copy / Paste</span>
-                <div class="help-row"><span class="help-label">Select</span><span>Click and drag in terminal</span></div>
-                <div class="help-row"><kbd>Ctrl+C</kbd><span>Copy selection (when text selected)</span></div>
-                <div class="help-row"><kbd>Ctrl+V</kbd><span>Paste from clipboard</span></div>
-              </div>
-              <div class="help-group">
-                <span class="help-group-title">Activity Notifications</span>
-                <div class="help-row"><span class="help-label">Orange dot</span><span>Workspace tab has unseen terminal output</span></div>
-                <div class="help-row"><span class="help-label">Pulsing</span><span>Dot pulses gently — new output since you last viewed</span></div>
-                <div class="help-row"><span class="help-label">Auto-clear</span><span>Badge disappears when you switch to that workspace</span></div>
-                <div class="help-row"><span class="help-label">Polling</span><span>Checks tmux activity every 10 seconds</span></div>
-              </div>
-              <div class="help-group">
-                <span class="help-group-title">Install as App</span>
-                <div class="help-row"><span class="help-label">Edge/Chrome</span><span>Click install icon in address bar → Pin to taskbar</span></div>
-                <div class="help-row"><span class="help-label">Standalone</span><span>Runs as its own window with no browser chrome</span></div>
-              </div>
-              <div class="help-group">
-                <span class="help-group-title">Terminal Rendering</span>
-                <div class="help-row"><span class="help-label">Font stack</span><span>JetBrains Mono → Cascadia Code → Fira Code → system</span></div>
-                <div class="help-row"><span class="help-label">Wide chars</span><span>Emoji &amp; CJK render at double-width (Unicode 11)</span></div>
-                <div class="help-row">
-                  <button
-                    class="help-test-btn"
-                    onclick={runRenderTest}
-                    disabled={renderTestLoading}
-                  >{renderTestLoading ? 'Sending...' : 'Run Glyph Test'}</button>
-                  <span>Sends test output to the first pane in this workspace</span>
-                </div>
-              </div>
-              <div class="help-about">
-                <img class="help-about-icon" src="/icon.svg" alt="Session Deck" width="48" height="48" />
-                <span class="help-about-title">Session Deck</span>
-                <span class="help-about-desc">Web-based tmux workspace manager</span>
-                <span class="help-about-version">v0.1.0</span>
-                <a class="help-about-link" href="https://github.com/JesseProjects-LLC/session-deck" target="_blank" rel="noopener">GitHub</a>
-                <span class="help-about-author">by <a class="help-about-link" href="https://github.com/JesseProjects-LLC" target="_blank" rel="noopener">Jesse Jones</a></span>
-                {#if authUser}
-                  <span class="help-about-auth">Signed in as {authUser.name} ({authUser.method})</span>
-                {:else}
-                  <span class="help-about-auth">No authentication</span>
-                {/if}
-              </div>
-            </div>
+            <HelpSection
+              {language}
+              {authUser}
+              {renderTestLoading}
+              onRunRenderTest={runRenderTest}
+            />
           {/if}
         </div>
       </div>
@@ -2030,295 +2265,218 @@
   <!-- Workspace context menu -->
   {#if contextMenu}
     <div class="ctx-menu" style="left:{contextMenu.x}px;top:{contextMenu.y}px">
-      <button class="ctx-item" onclick={() => openRename(contextMenu.id)}>Rename</button>
-      <button class="ctx-item" onclick={() => handleDuplicate(contextMenu.id)}>Duplicate</button>
-      <button class="ctx-item" onclick={() => saveAsTemplate(contextMenu.id)}>Save as Template</button>
+      <button class="ctx-item" onclick={() => openRename(contextMenu.id)}>{t('rename')}</button>
+      <button class="ctx-item" onclick={() => handleDuplicate(contextMenu.id)}>{t('duplicate')}</button>
+      <button class="ctx-item" onclick={() => saveAsTemplate(contextMenu.id)}>{t('saveAsTemplate')}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item danger" onclick={() => openDeleteConfirm(contextMenu.id)}>Delete</button>
+      <button class="ctx-item danger" onclick={() => openDeleteConfirm(contextMenu.id)}>{t('delete')}</button>
     </div>
   {/if}
 
   <!-- Pane context menu -->
   {#if paneMenu}
     <div class="ctx-menu" style="left:{paneMenu.x}px;top:{paneMenu.y}px">
-      <button class="ctx-item" onclick={() => { openSessionPicker(paneMenu.path, paneMenu.session); paneMenu = null; }}>Change Session</button>
-      <button class="ctx-item" onclick={() => { openRenameSessionModal(paneMenu.session, paneMenu.host); paneMenu = null; }}>Rename Session</button>
-      <button class="ctx-item" onclick={() => { openRenamePaneModal(paneMenu.path, paneMenu.session, paneMenu.host); paneMenu = null; }}>Rename Pane</button>
+      <button class="ctx-item" onclick={() => { openSessionPicker(paneMenu.path, paneMenu.session); paneMenu = null; }}>{t('changeSession')}</button>
+      <button class="ctx-item" onclick={() => { openRenameSessionModal(paneMenu.session, paneMenu.host); paneMenu = null; }}>{t('renameSession')}</button>
+      <button class="ctx-item" onclick={() => { openRenamePaneModal(paneMenu.path, paneMenu.session, paneMenu.host); paneMenu = null; }}>{t('renamePane')}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => { handleSplitPane(paneMenu.path, 'h'); paneMenu = null; }}>Split Left/Right</button>
-      <button class="ctx-item" onclick={() => { handleSplitPane(paneMenu.path, 'v'); paneMenu = null; }}>Split Top/Bottom</button>
+      <button class="ctx-item" onclick={() => { handleSplitPane(paneMenu.path, 'h'); paneMenu = null; }}>{t('splitLeftRight')}</button>
+      <button class="ctx-item" onclick={() => { handleSplitPane(paneMenu.path, 'v'); paneMenu = null; }}>{t('splitTopBottom')}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => { handleZoom(nodeIdFromPane(paneMenu), paneMenu.session, paneMenu.host); paneMenu = null; }}>{zoomedPane ? 'Restore' : 'Zoom'}</button>
-      <button class="ctx-item danger" onclick={() => { handleClosePane(paneMenu.path); paneMenu = null; }}>Close Pane</button>
+      <button class="ctx-item" onclick={() => { handleZoom(nodeIdFromPane(paneMenu), paneMenu.session, paneMenu.host); paneMenu = null; }}>{zoomedPane ? t('restore') : t('zoom')}</button>
+      <button class="ctx-item danger" onclick={() => { handleClosePane(paneMenu.path); paneMenu = null; }}>{t('closePane')}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => { handleExportScrollback(paneMenu.session, paneMenu.host); paneMenu = null; }}>Export Scrollback</button>
+      <button class="ctx-item" onclick={() => { handleExportScrollback(paneMenu.session, paneMenu.host); paneMenu = null; }}>{t('exportScrollback')}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item danger" onclick={() => { openDeleteSessionModal(paneMenu.session, paneMenu.host); paneMenu = null; }}>Kill Session</button>
+      <button class="ctx-item danger" onclick={() => { openDeleteSessionModal(paneMenu.session, paneMenu.host); paneMenu = null; }}>{t('killSession')}</button>
     </div>
   {/if}
 
   <!-- Session picker overlay -->
   {#if showSessionPicker}
-    <div class="picker-overlay modal-top" role="dialog" onclick={closeSessionPicker}>
-      <div class="picker" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>Assign Session to Pane</span>
-          <button class="picker-close" onclick={closeSessionPicker}>&times;</button>
-        </div>
-        <div class="picker-body">
-          {#each sessions as s}
-            <button
-              class="picker-item"
-              class:current={s.name === showSessionPicker.currentSession}
-              onclick={() => assignSession(s)}
-            >
-              <span class="dot" style="background:{typeColor(s.type)};box-shadow:0 0 6px {typeColor(s.type)}"></span>
-              <span class="picker-name">{s.name}</span>
-              <span class="picker-host">{s.host || 'reliant'}</span>
-              {#if s.name === showSessionPicker.currentSession}
-                <span class="picker-current">current</span>
-              {/if}
-            </button>
-          {/each}
-        </div>
-        <div class="picker-footer">
-          <button class="footer-link" onclick={() => { closeSessionPicker(); openSessionManager(); }}>Manage Sessions</button>
-        </div>
-      </div>
-    </div>
+    <SessionPicker
+      {language}
+      {sessions}
+      {typeColor}
+      currentSession={showSessionPicker.currentSession}
+      onClose={closeSessionPicker}
+      onAssign={assignSession}
+      onNewSession={openCreateSessionForCurrentPicker}
+      onManageSessions={() => { closeSessionPicker(); openSessionManager(); }}
+    />
   {/if}
 
 
   <!-- Rename session modal -->
   {#if showRenameSession}
-    <div class="picker-overlay modal-top" role="dialog" onclick={() => showRenameSession = null}>
-      <div class="picker" style="width:320px" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>Rename Session</span>
-          <button class="picker-close" onclick={() => showRenameSession = null}>&times;</button>
-        </div>
-        <div class="modal-body">
-          <p class="confirm-text" style="font-size:11px;color:#6b7688">
-            Renaming "{showRenameSession.name}" on {showRenameSession.host}
-          </p>
-          <input
-            class="field-input"
-            type="text"
-            bind:value={renameSessionValue}
-            onkeydown={(e) => e.key === 'Enter' && handleRenameSession()}
-          />
-          <button
-            class="action-btn"
-            onclick={handleRenameSession}
-            disabled={!renameSessionValue.trim() || sessionMgrLoading}
-          >{sessionMgrLoading ? 'Renaming...' : 'Rename'}</button>
-        </div>
+    <Modal title={t('renameSession')} closeLabel={t('close')} onClose={() => showRenameSession = null}>
+      <div class="modal-body">
+        <p class="confirm-text" style="font-size:11px;color:#6b7688">
+          {t('renamingSession', { name: showRenameSession.name, host: showRenameSession.host })}
+        </p>
+        <input
+          class="field-input"
+          type="text"
+          bind:value={renameSessionValue}
+          aria-label={t('renameSession')}
+          onkeydown={(e) => e.key === 'Enter' && handleRenameSession()}
+        />
+        <button
+          class="action-btn"
+          onclick={handleRenameSession}
+          disabled={!renameSessionValue.trim() || sessionMgrLoading}
+        >{sessionMgrLoading ? t('renaming') : t('rename')}</button>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   <!-- Rename pane modal -->
   {#if showRenamePaneModal}
-    <div class="picker-overlay modal-top" role="dialog" onclick={() => showRenamePaneModal = null}>
-      <div class="picker" style="width:320px" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>Rename Pane</span>
-          <button class="picker-close" onclick={() => showRenamePaneModal = null}>&times;</button>
-        </div>
-        <div class="modal-body">
-          <p class="confirm-text" style="font-size:11px;color:var(--text-secondary)">
-            Custom label for "{showRenamePaneModal.session}" on {showRenamePaneModal.host}
-          </p>
-          <input
-            class="field-input"
-            type="text"
-            bind:value={renamePaneValue}
-            placeholder="Enter custom name (or leave empty to clear)"
-            onkeydown={(e) => e.key === 'Enter' && handleRenamePane()}
-            autofocus
-          />
-          <div class="btn-row">
-            {#if renamePaneValue || showRenamePaneModal}
-              <button class="action-btn secondary" onclick={() => { renamePaneValue = ''; handleRenamePane(); }}>Clear Name</button>
-            {/if}
-            <button class="action-btn" onclick={handleRenamePane}>
-              {renamePaneValue.trim() ? 'Rename' : 'Clear'}
-            </button>
-          </div>
+    <Modal title={t('renamePane')} closeLabel={t('close')} onClose={() => showRenamePaneModal = null}>
+      <div class="modal-body">
+        <p class="confirm-text" style="font-size:11px;color:var(--text-secondary)">
+          {t('customPaneLabel', { session: showRenamePaneModal.session, host: showRenamePaneModal.host })}
+        </p>
+        <input
+          class="field-input"
+          type="text"
+          bind:value={renamePaneValue}
+          placeholder={t('paneNamePlaceholder')}
+          aria-label={t('renamePane')}
+          onkeydown={(e) => e.key === 'Enter' && handleRenamePane()}
+        />
+        <div class="btn-row">
+          {#if renamePaneValue || showRenamePaneModal}
+            <button class="action-btn secondary" onclick={() => { renamePaneValue = ''; handleRenamePane(); }}>{t('clearName')}</button>
+          {/if}
+          <button class="action-btn" onclick={handleRenamePane}>
+            {renamePaneValue.trim() ? t('rename') : t('clear')}
+          </button>
         </div>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   <!-- Delete session confirmation -->
   {#if showDeleteSession}
-    <div class="picker-overlay modal-top" role="dialog" onclick={() => showDeleteSession = null}>
-      <div class="picker" style="width:360px" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>Kill Session</span>
-          <button class="picker-close" onclick={() => showDeleteSession = null}>&times;</button>
-        </div>
-        <div class="modal-body">
-          <p class="confirm-text">Kill session "{showDeleteSession.name}" on {showDeleteSession.host}?</p>
-          <p class="confirm-warn">Any running processes in this session will be terminated.</p>
-          <div class="btn-row">
-            <button class="action-btn secondary" onclick={() => showDeleteSession = null}>Cancel</button>
-            <button
-              class="action-btn danger"
-              onclick={handleDeleteSession}
-              disabled={sessionMgrLoading}
-            >{sessionMgrLoading ? 'Killing...' : 'Kill Session'}</button>
-          </div>
+    <Modal title={t('killSession')} width="360px" closeLabel={t('close')} onClose={() => showDeleteSession = null}>
+      <div class="modal-body">
+        <p class="confirm-text">{t('killSessionConfirm', { name: showDeleteSession.name, host: showDeleteSession.host })}</p>
+        <p class="confirm-warn">{t('killSessionWarn')}</p>
+        <div class="btn-row">
+          <button class="action-btn secondary" onclick={() => showDeleteSession = null}>{t('cancel')}</button>
+          <button
+            class="action-btn danger"
+            onclick={handleDeleteSession}
+            disabled={sessionMgrLoading}
+          >{sessionMgrLoading ? t('killing') : t('killSession')}</button>
         </div>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   <!-- New workspace modal -->
   {#if showNewWsModal}
-    <div class="picker-overlay modal-top" role="dialog" onclick={() => showNewWsModal = false}>
-      <div class="picker" style="width:360px" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>New Workspace</span>
-          <button class="picker-close" onclick={() => showNewWsModal = false}>&times;</button>
-        </div>
-        <div class="modal-body">
-          <label class="field-label">Name</label>
-          <input
-            class="field-input"
-            type="text"
-            bind:value={newWsName}
-            placeholder="my-workspace"
-            onkeydown={(e) => e.key === 'Enter' && handleCreateWorkspace()}
-          />
-          <label class="field-label">Layout preset</label>
-          <div class="preset-grid">
-            {#each ['dual', 'claude-focus', 'quad', 'infra', 'deck', 'mixed'] as p}
-              <button
-                class="preset-btn"
-                class:active={newWsPreset === p}
-                onclick={() => newWsPreset = p}
-              >{p}</button>
-            {/each}
-          </div>
-          {#if templates.length > 0}
-            <label class="field-label">Saved templates</label>
-            <div class="preset-grid">
-              {#each templates as tpl}
-                <button
-                  class="preset-btn template-btn"
-                  class:active={newWsPreset === `tpl:${tpl.id}`}
-                  onclick={() => newWsPreset = `tpl:${tpl.id}`}
-                  title="{tpl.paneCount} panes"
-                >{tpl.name} <span class="tpl-cnt">{tpl.paneCount}p</span></button>
-              {/each}
-            </div>
-          {/if}
-          <button class="action-btn" onclick={handleCreateWorkspace} disabled={!newWsName.trim()}>Create</button>
-        </div>
+    <Modal title={t('newWorkspace')} width="360px" closeLabel={t('close')} onClose={() => showNewWsModal = false}>
+      <div class="modal-body">
+        <label class="field-label" for="new-workspace-name">{t('name')}</label>
+        <input
+          id="new-workspace-name"
+          class="field-input"
+          type="text"
+          bind:value={newWsName}
+          placeholder="my-workspace"
+          onkeydown={(e) => e.key === 'Enter' && handleCreateWorkspace()}
+        />
+        <button class="action-btn" onclick={handleCreateWorkspace} disabled={!newWsName.trim()}>{t('create')}</button>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   <!-- Rename modal -->
   {#if showRenameModal}
-    <div class="picker-overlay modal-top" role="dialog" onclick={() => showRenameModal = null}>
-      <div class="picker" style="width:320px" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>Rename Workspace</span>
-          <button class="picker-close" onclick={() => showRenameModal = null}>&times;</button>
-        </div>
-        <div class="modal-body">
-          <input class="field-input" type="text" bind:value={renameValue}
-            onkeydown={(e) => e.key === 'Enter' && handleRename()} />
-          <button class="action-btn" onclick={handleRename} disabled={!renameValue.trim()}>Rename</button>
-        </div>
+    <Modal title={t('renameWorkspace')} closeLabel={t('close')} onClose={() => showRenameModal = null}>
+      <div class="modal-body">
+        <input
+          class="field-input"
+          type="text"
+          bind:value={renameValue}
+          aria-label={t('renameWorkspace')}
+          onkeydown={(e) => e.key === 'Enter' && handleRename()}
+        />
+        <button class="action-btn" onclick={handleRename} disabled={!renameValue.trim()}>{t('rename')}</button>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   <!-- Delete confirmation -->
   {#if showDeleteConfirm}
-    <div class="picker-overlay modal-top" role="dialog" onclick={() => showDeleteConfirm = null}>
-      <div class="picker" style="width:320px" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>Delete Workspace</span>
-          <button class="picker-close" onclick={() => showDeleteConfirm = null}>&times;</button>
-        </div>
-        <div class="modal-body">
-          <p class="confirm-text">Delete "{workspaces.find(w => w.id === showDeleteConfirm)?.name}"? This can't be undone.</p>
-          <div class="btn-row">
-            <button class="action-btn secondary" onclick={() => showDeleteConfirm = null}>Cancel</button>
-            <button class="action-btn danger" onclick={handleDelete}>Delete</button>
-          </div>
+    <Modal title={t('deleteWorkspace')} closeLabel={t('close')} onClose={() => showDeleteConfirm = null}>
+      <div class="modal-body">
+        <p class="confirm-text">{t('deleteWorkspaceConfirm', { name: workspaces.find(w => w.id === showDeleteConfirm)?.name })}</p>
+        <div class="btn-row">
+          <button class="action-btn secondary" onclick={() => showDeleteConfirm = null}>{t('cancel')}</button>
+          <button class="action-btn danger" onclick={handleDelete}>{t('delete')}</button>
         </div>
       </div>
-    </div>
+    </Modal>
+  {/if}
+
+  <!-- Install tmux confirmation -->
+  {#if hostInstallConfirm}
+    <Modal title={t('installTmuxTitle')} width="380px" closeLabel={t('close')} onClose={() => hostInstallConfirm = null}>
+      <div class="modal-body">
+        <p class="confirm-text">{t('installTmuxConfirm', { name: hostInstallConfirm.name })}</p>
+        {#if hostInstallConfirm._testResult?.installCommand}
+          <code class="host-setup-cmd">{hostInstallConfirm._testResult.installCommand}</code>
+        {/if}
+        <p class="confirm-warn">{t('installTmuxWarn')}</p>
+        <div class="btn-row">
+          <button class="action-btn secondary" onclick={() => hostInstallConfirm = null}>{t('cancel')}</button>
+          <button
+            class="action-btn"
+            onclick={() => installTmuxOnHost(hostInstallConfirm)}
+            disabled={hostInstalling[hostInstallConfirm.id]}
+          >{hostInstalling[hostInstallConfirm.id] ? t('installing') : t('install')}</button>
+        </div>
+      </div>
+    </Modal>
   {/if}
 
   <!-- Save as Template modal -->
   {#if showSaveTemplateModal}
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="picker-overlay modal-top" role="dialog" tabindex="-1" onclick={() => showSaveTemplateModal = null}>
-      <div class="picker" style="width:320px" onclick={(e) => e.stopPropagation()}>
-        <div class="picker-hdr">
-          <span>Save as Template</span>
-          <button class="picker-close" onclick={() => showSaveTemplateModal = null}>&times;</button>
-        </div>
-        <div class="modal-body">
-          <label class="field-label">Template name</label>
-          <input
-            class="field-input"
-            bind:value={saveTemplateName}
-            placeholder="My layout"
-            onkeydown={(e) => e.key === 'Enter' && handleSaveTemplate()}
-          />
-          <p class="help-text">Saves the pane layout structure. Session assignments are not included — they'll be auto-assigned when creating a workspace from this template.</p>
-          <div class="btn-row">
-            <button class="action-btn secondary" onclick={() => showSaveTemplateModal = null}>Cancel</button>
-            <button class="action-btn" onclick={handleSaveTemplate} disabled={!saveTemplateName.trim()}>Save Template</button>
-          </div>
+    <Modal title={t('saveAsTemplate')} closeLabel={t('close')} onClose={() => showSaveTemplateModal = null}>
+      <div class="modal-body">
+        <label class="field-label" for="template-name">{t('templateName')}</label>
+        <input
+          id="template-name"
+          class="field-input"
+          bind:value={saveTemplateName}
+          placeholder={t('templatePlaceholder')}
+          onkeydown={(e) => e.key === 'Enter' && handleSaveTemplate()}
+        />
+        <p class="help-text">{t('templateHelp')}</p>
+        <div class="btn-row">
+          <button class="action-btn secondary" onclick={() => showSaveTemplateModal = null}>{t('cancel')}</button>
+          <button class="action-btn" onclick={handleSaveTemplate} disabled={!saveTemplateName.trim()}>{t('saveTemplate')}</button>
         </div>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   <!-- Command palette -->
   {#if showCommandPalette}
-    <div class="palette-overlay" onclick={() => showCommandPalette = false}>
-      <div class="palette" onclick={(e) => e.stopPropagation()}>
-        <div class="palette-input-row">
-          <span class="palette-icon">⌘</span>
-          <input
-            class="palette-input"
-            type="text"
-            placeholder="Type a command..."
-            bind:value={paletteQuery}
-            onkeydown={handlePaletteKeydown}
-            oninput={() => paletteIndex = 0}
-            autofocus
-          />
-        </div>
-        <div class="palette-results">
-          {#each filteredPaletteCommands() as cmd, i}
-            <button
-              class="palette-item"
-              class:active={i === paletteIndex}
-              onclick={() => executePaletteCommand(cmd)}
-              onmouseenter={() => paletteIndex = i}
-            >
-              <span class="palette-category">{cmd.category}</span>
-              <span class="palette-label">{cmd.label}</span>
-              {#if cmd.hint}
-                <kbd class="palette-hint">{cmd.hint}</kbd>
-              {/if}
-            </button>
-          {:else}
-            <div class="palette-empty">No matching commands</div>
-          {/each}
-        </div>
-      </div>
-    </div>
+    <CommandPalette
+      {language}
+      query={paletteQuery}
+      index={paletteIndex}
+      commands={filteredPaletteCommands()}
+      onClose={() => showCommandPalette = false}
+      onQuery={(value) => paletteQuery = value}
+      onIndex={(value) => paletteIndex = value}
+      onKeydown={handlePaletteKeydown}
+      onExecute={executePaletteCommand}
+    />
   {/if}
 
   <!-- Setup wizard (first-run) -->
@@ -2336,25 +2494,31 @@
 
         {#if setupStep === 1}
           <div class="setup-content">
-            <h2 class="setup-title">Welcome to Session Deck</h2>
-            <p class="setup-desc">Let's set up your terminal workspace. First, we'll import your SSH hosts so Session Deck knows which machines to connect to.</p>
-            <p class="setup-hint">Session Deck will read your <code>~/.ssh/config</code> file to find configured hosts.</p>
+            <h2 class="setup-title">{t('welcome')}</h2>
+            <p class="setup-desc">{t('setupImportDesc')}</p>
+            <p class="setup-hint">
+              {#if language === 'zh-CN'}
+                Session Deck 会读取你的 <code>~/.ssh/config</code> 文件来查找已配置主机。
+              {:else}
+                Session Deck will read your <code>~/.ssh/config</code> file to find configured hosts.
+              {/if}
+            </p>
             <div class="setup-actions">
               <button class="action-btn" onclick={setupImportHosts} disabled={setupImporting}>
-                {setupImporting ? 'Importing...' : 'Import from SSH Config'}
+                {setupImporting ? t('importing') : t('importFromSshConfig')}
               </button>
               <button class="setup-link" onclick={() => { showSetupWizard = false; openSettingsSection('servers'); }}>
-                Add hosts manually instead
+                {t('addHostsManually')}
               </button>
             </div>
-            <button class="setup-skip" onclick={setupSkip}>Skip setup</button>
+            <button class="setup-skip" onclick={setupSkip}>{t('skipSetup')}</button>
           </div>
 
         {:else if setupStep === 2}
           <div class="setup-content">
-            <h2 class="setup-title">Test Your Hosts</h2>
+            <h2 class="setup-title">{t('testYourHosts')}</h2>
             <p class="setup-desc">
-              {managedHosts.length} hosts imported. Let's test which ones are reachable and have tmux installed.
+              {t('hostsImported', { count: managedHosts.length })}
             </p>
 
             {#if setupTestResults.length > 0}
@@ -2363,11 +2527,11 @@
                   <div class="setup-result-row">
                     <span class="setup-result-name">{r.name}</span>
                     {#if r.status === 'ok'}
-                      <span class="host-badge ok-badge">reachable</span>
+                      <span class="host-badge ok-badge">{t('reachable')}</span>
                       {#if r.tmuxAvailable}
                         <span class="host-badge tmux-badge">tmux</span>
                       {:else}
-                        <span class="host-badge no-tmux-badge">no tmux</span>
+                        <span class="host-badge no-tmux-badge">{t('noTmux')}</span>
                       {/if}
                     {:else}
                       <span class="host-badge error-badge">{r.error || 'unreachable'}</span>
@@ -2378,9 +2542,9 @@
               {@const reachable = setupTestResults.filter(r => r.status === 'ok').length}
               {@const withTmux = setupTestResults.filter(r => r.tmuxAvailable).length}
               <p class="setup-summary">
-                {reachable} of {setupTestResults.length} reachable, {withTmux} with tmux.
+                {t('reachableSummary', { reachable, total: setupTestResults.length, withTmux })}
                 {#if withTmux === 0}
-                  <span class="setup-warn">No hosts have tmux. You'll need to install it before connecting.</span>
+                  <span class="setup-warn">{t('noHostsTmux')}</span>
                 {/if}
               </p>
             {/if}
@@ -2388,32 +2552,32 @@
             <div class="setup-actions">
               {#if setupTestResults.length === 0}
                 <button class="action-btn" onclick={setupTestAllHosts} disabled={setupTesting}>
-                  {setupTesting ? 'Testing...' : 'Test All Hosts'}
+                  {setupTesting ? t('testing') : t('testAllHosts')}
                 </button>
               {:else}
                 <button class="action-btn" onclick={() => setupStep = 3}>
-                  Continue
+                  {t('continue')}
                 </button>
                 <button class="setup-link" onclick={setupTestAllHosts} disabled={setupTesting}>
-                  {setupTesting ? 'Re-testing...' : 'Re-test'}
+                  {setupTesting ? t('retesting') : t('retest')}
                 </button>
               {/if}
             </div>
-            <button class="setup-skip" onclick={() => setupStep = 3}>Skip testing</button>
+            <button class="setup-skip" onclick={() => setupStep = 3}>{t('skipTesting')}</button>
           </div>
 
         {:else if setupStep === 3}
           <div class="setup-content">
-            <h2 class="setup-title">Create Your First Workspace</h2>
+            <h2 class="setup-title">{t('createFirstWorkspace')}</h2>
             <p class="setup-desc">
-              A workspace is a layout of terminal panes. Pick a preset to get started — you can customize it later.
+              {t('workspaceIntro')}
             </p>
             <label class="host-field">
-              <span class="host-field-label">Workspace Name</span>
+              <span class="host-field-label">{t('workspaceName')}</span>
               <input class="field-input" type="text" bind:value={setupWsName} placeholder="Default" />
             </label>
             <label class="host-field">
-              <span class="host-field-label">Layout Preset</span>
+              <span class="host-field-label">{t('layoutPresetTitle')}</span>
               <div class="setup-presets">
                 {#each [
                   { id: 'dual', label: 'Dual', desc: '2 panes side by side' },
@@ -2436,7 +2600,7 @@
             </label>
             <div class="setup-actions">
               <button class="action-btn" onclick={setupCreateWorkspace} disabled={!setupWsName.trim()}>
-                Create Workspace
+                {t('createWorkspace')}
               </button>
             </div>
           </div>
@@ -2457,14 +2621,14 @@
       {@const fi = getFocusedSession()}
       {@const fh = getFocusedHost()}
       {#if fi}
-        <span class="sb-focused" title="Focused pane">
+        <span class="sb-focused" title={t('focusedPane')}>
           <span class="sb-dot" style="background:{getTypeInfo(fi.name).color}"></span>
           <span class="sb-session">{fi.name}</span>
           <span class="sb-host">{fh}</span>
         </span>
       {/if}
     {:else}
-      <span class="sb-hint">Click a pane to focus</span>
+      <span class="sb-hint">{t('clickPaneFocus')}</span>
     {/if}
     <span class="spacer"></span>
     <button class="shortcut-btn" onclick={openCommandPalette}><kbd>Ctrl+K</kbd></button>
@@ -2603,73 +2767,6 @@
   .zoomed-container { width: 100%; height: 100%; }
   .zoom-indicator { color: var(--success); }
 
-  /* Properties panel */
-  .props-panel {
-    width: 240px; flex-shrink: 0;
-    background: var(--bg-surface); border-left: 1px solid var(--border);
-    display: flex; flex-direction: column;
-    overflow-y: auto;
-  }
-  .props-hdr {
-    padding: 10px 12px; display: flex; align-items: center; justify-content: space-between;
-    border-bottom: 1px solid var(--border); flex-shrink: 0;
-  }
-  .props-title { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
-  .props-body { padding: 12px; }
-  .props-empty {
-    flex: 1; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; gap: 8px;
-    color: var(--text-muted); font-size: 12px; padding: 24px;
-  }
-  .props-empty-icon {
-    width: 32px; height: 32px; border: 2px solid #3d4450; border-radius: 50%;
-    opacity: 0.4; position: relative;
-  }
-  .props-empty-icon::after {
-    content: ''; position: absolute; top: 50%; left: 50%;
-    width: 8px; height: 8px; background: #3d4450; border-radius: 50%;
-    transform: translate(-50%, -50%);
-  }
-
-  .prop-section { display: flex; flex-direction: column; gap: 8px; }
-  .prop-session-name {
-    display: flex; align-items: center; gap: 8px;
-    font-family: 'JetBrains Mono', monospace; font-size: 14px;
-    color: var(--text-primary); font-weight: 600;
-  }
-  .prop-type-badge {
-    font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 500;
-    align-self: flex-start;
-  }
-
-  .prop-divider { height: 1px; background: var(--border); margin: 4px 0; }
-
-  .prop-row { display: flex; justify-content: space-between; align-items: center; }
-  .prop-label { font-size: 11px; color: var(--text-secondary); }
-  .prop-value { font-size: 11px; color: var(--text-primary); font-family: 'JetBrains Mono', monospace; }
-
-  .prop-section-title {
-    font-size: 10px; color: var(--text-muted); text-transform: uppercase;
-    letter-spacing: 0.5px; font-weight: 600;
-  }
-
-  .prop-badge {
-    font-size: 9px; padding: 1px 6px; border-radius: 3px; font-weight: 500;
-  }
-  .prop-badge.attached { background: var(--success-bg); color: var(--success); }
-  .prop-badge.detached { background: var(--danger-bg); color: var(--danger); }
-
-  .prop-ws-link {
-    width: 100%; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border);
-    background: transparent; color: var(--text-primary); font-size: 11px; text-align: left;
-    cursor: pointer; font-family: 'JetBrains Mono', monospace;
-    display: flex; align-items: center; gap: 6px; transition: all 0.1s;
-  }
-  .prop-ws-link:hover { border-color: var(--accent); color: var(--accent); }
-  .prop-ws-link.current { border-color: var(--accent-border-strong); background: var(--accent-bg); }
-  .prop-current-tag { font-size: 8px; padding: 0 4px; border-radius: 2px; background: var(--accent-bg-strong); color: var(--accent); }
-  .prop-value.dim { color: var(--text-muted); font-style: italic; font-size: 10px; }
-
   /* Context menu */
   .ctx-menu {
     position: fixed; z-index: 3000;
@@ -2709,19 +2806,7 @@
     display: flex; align-items: center; justify-content: center; font-size: 12px;
   }
   .picker-close:hover { border-color: var(--danger); color: var(--danger); }
-  .picker-body { flex: 1; overflow-y: auto; padding: 4px; }
-  .picker-item {
-    width: 100%; padding: 8px 12px; border: none; background: transparent;
-    display: flex; align-items: center; gap: 8px; cursor: pointer;
-    border-radius: 6px; font-size: 13px; text-align: left;
-    color: var(--text-primary); transition: background 0.1s;
-  }
-  .picker-item:hover { background: var(--bg-elevated); }
-  .picker-item.current { background: var(--accent-bg); }
   .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-  .picker-name { font-family: 'JetBrains Mono', monospace; font-size: 12px; flex: 1; }
-  .picker-host { font-size: 10px; color: var(--text-muted); }
-  .picker-current { font-size: 9px; padding: 1px 6px; border-radius: 3px; background: var(--accent-bg-strong); color: var(--accent); }
 
   .modal-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
   .field-label { font-size: 11px; color: var(--text-secondary); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -2802,18 +2887,6 @@
     background: var(--bg-base); border: 1px solid var(--border); color: var(--text-secondary);
   }
 
-  /* Session picker footer */
-  .picker-footer {
-    padding: 8px 12px; border-top: 1px solid var(--border);
-    display: flex; justify-content: center;
-  }
-  .footer-link {
-    background: none; border: none; color: var(--accent); font-size: 11px;
-    cursor: pointer; font-family: 'DM Sans', sans-serif; padding: 4px 8px;
-    border-radius: 4px; transition: background 0.1s;
-  }
-  .footer-link:hover { background: var(--accent-bg-med); }
-
   /* Session manager */
   .session-mgr { width: 500px; max-height: 600px; }
   .mgr-tabs { display: flex; gap: 2px; margin-left: auto; }
@@ -2857,6 +2930,13 @@
     display: flex; align-items: center; justify-content: center;
     transition: all 0.1s;
   }
+  .mgr-act.text-act {
+    width: auto;
+    min-width: 38px;
+    padding: 0 8px;
+    font-size: 11px;
+    font-family: 'DM Sans', sans-serif;
+  }
   .mgr-act:hover { background: var(--bg-hover); border-color: #2a3345; color: var(--text-primary); }
   .mgr-act.danger:hover { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger); }
 
@@ -2897,73 +2977,6 @@
     font-size: 11px; color: var(--danger); margin: 0; padding: 6px 10px;
     background: var(--danger-bg-subtle); border-radius: 4px;
     border: 1px solid var(--danger-border-subtle);
-  }
-
-  /* Properties panel session actions */
-  .prop-actions { display: flex; gap: 4px; margin-top: 4px; }
-  .prop-act-btn {
-    padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border);
-    background: transparent; color: var(--text-secondary); font-size: 10px; cursor: pointer;
-    font-family: 'DM Sans', sans-serif; transition: all 0.1s;
-  }
-  .prop-act-btn:hover { border-color: var(--accent); color: var(--text-primary); }
-  .prop-act-btn.danger { border-color: rgba(240,113,120,0.2); color: var(--text-secondary); }
-  .prop-act-btn.danger:hover { border-color: var(--danger); color: var(--danger); background: var(--danger-bg-subtle); }
-
-  /* Settings dropdown menu */
-  .settings-dropdown {
-    position: absolute; top: 100%; left: 0; margin-top: 4px; z-index: 3000;
-    background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.5); padding: 4px; min-width: 200px;
-  }
-  .settings-item {
-    width: 100%; padding: 8px 12px; border: none; background: transparent;
-    color: var(--text-primary); font-size: 12px; text-align: left; cursor: pointer;
-    border-radius: 4px; display: flex; align-items: center; gap: 10px;
-    font-family: 'DM Sans', sans-serif; transition: background 0.1s;
-  }
-  .settings-item:hover { background: var(--bg-hover); }
-  .settings-hint {
-    margin-left: auto; font-size: 10px; color: var(--text-muted);
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .settings-sep { height: 1px; background: var(--border-strong); margin: 4px 8px; }
-
-  /* Settings icons — pure CSS */
-  .settings-icon {
-    display: inline-block; width: 14px; height: 14px; flex-shrink: 0;
-    position: relative;
-  }
-  .servers-icon::before {
-    content: ''; position: absolute; top: 1px; left: 2px;
-    width: 10px; height: 4px; border: 1.5px solid currentColor; border-radius: 2px;
-  }
-  .servers-icon::after {
-    content: ''; position: absolute; bottom: 1px; left: 2px;
-    width: 10px; height: 4px; border: 1.5px solid currentColor; border-radius: 2px;
-  }
-  .sessions-icon::before {
-    content: ''; position: absolute; top: 2px; left: 2px;
-    width: 10px; height: 10px; border: 1.5px solid currentColor; border-radius: 2px;
-  }
-  .sessions-icon::after {
-    content: '>'; position: absolute; top: 3px; left: 5px;
-    font-size: 8px; color: currentColor; font-weight: bold;
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .appearance-icon::before {
-    content: ''; position: absolute; top: 2px; left: 2px;
-    width: 10px; height: 10px; border-radius: 50%;
-    border: 1.5px solid currentColor;
-  }
-  .appearance-icon::after {
-    content: ''; position: absolute; top: 4px; left: 6px;
-    width: 4px; height: 4px; background: currentColor; border-radius: 50%;
-  }
-  .help-icon::before {
-    content: '?'; position: absolute; top: 0; left: 3px;
-    font-size: 12px; font-weight: 700; color: currentColor;
-    font-family: 'JetBrains Mono', monospace;
   }
 
   /* Settings panel (slide-over) */
@@ -3069,6 +3082,26 @@
   .accent-custom input[type="color"]::-webkit-color-swatch { border: none; border-radius: 4px; }
   .accent-custom-label { font-size: 10px; color: var(--text-muted); }
 
+  .language-options {
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
+  .language-option {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: transparent; color: var(--text-secondary); font-size: 12px;
+    font-family: 'DM Sans', sans-serif; cursor: pointer; transition: all 0.12s;
+  }
+  .language-option:hover { border-color: var(--accent); color: var(--text-primary); }
+  .language-option.active {
+    border-color: var(--accent); background: var(--accent-bg-med); color: var(--accent);
+  }
+  .language-short {
+    width: 20px; height: 20px; border-radius: 4px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--bg-base); border: 1px solid var(--border);
+    font-size: 10px; font-family: 'JetBrains Mono', monospace;
+  }
+
   .type-list { display: flex; flex-direction: column; gap: 2px; }
   .type-row {
     display: flex; align-items: center; gap: 8px;
@@ -3105,59 +3138,6 @@
   }
   .type-name-input:focus { border-color: var(--accent); outline: none; }
 
-  /* Help section */
-  .help-section {
-    display: flex; flex-direction: column; gap: 20px;
-  }
-  .help-group {
-    display: flex; flex-direction: column; gap: 6px;
-  }
-  .help-group-title {
-    font-size: 10px; color: var(--text-muted); text-transform: uppercase;
-    letter-spacing: 0.5px; font-weight: 600; margin-bottom: 2px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .help-row {
-    display: flex; align-items: center; gap: 10px; font-size: 12px;
-    padding: 3px 0;
-  }
-  .help-row kbd {
-    font-size: 10px; padding: 2px 6px; border-radius: 3px; min-width: 24px;
-    text-align: center;
-    background: var(--bg-base); border: 1px solid var(--border); color: var(--text-secondary);
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .help-row span { color: var(--text-primary); }
-  .help-label {
-    font-size: 11px; color: var(--text-secondary); min-width: 100px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .help-test-btn {
-    font-size: 11px; padding: 4px 12px; border-radius: 4px;
-    border: 1px solid var(--accent-border, rgba(249,115,22,0.3));
-    background: var(--accent-bg, rgba(249,115,22,0.08));
-    color: var(--accent, #F97316); cursor: pointer;
-    font-family: 'DM Sans', sans-serif; font-weight: 500;
-    transition: all 0.12s; min-width: 100px;
-  }
-  .help-test-btn:hover { background: var(--accent-bg-strong, rgba(249,115,22,0.15)); }
-  .help-test-btn:disabled { opacity: 0.5; cursor: default; }
-  .help-about {
-    margin-top: 12px; padding-top: 16px; border-top: 1px solid var(--border);
-    display: flex; flex-direction: column; gap: 4px; text-align: center;
-  }
-  .help-about-title { font-size: 14px; font-weight: 700; color: var(--accent); font-family: 'JetBrains Mono', monospace; }
-  .help-about-icon { border-radius: 8px; margin-bottom: 4px; }
-  .help-about-desc { font-size: 11px; color: var(--text-secondary); }
-  .help-about-link {
-    font-size: 10px; color: var(--accent); font-family: 'JetBrains Mono', monospace;
-    text-decoration: none; transition: color 0.1s;
-  }
-  .help-about-link:hover { color: var(--accent-hover); text-decoration: underline; }
-  .help-about-author { font-size: 10px; color: var(--text-muted); }
-  .help-about-auth { font-size: 9px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
-  .help-about-version { font-size: 9px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; margin-top: 4px; }
-
   /* Host management */
   .host-mgr { display: flex; flex-direction: column; gap: 12px; }
   .host-mgr-toolbar {
@@ -3177,6 +3157,40 @@
   .host-toolbar-btn.primary { border-color: var(--accent); color: var(--accent); }
   .host-toolbar-btn.primary:hover { background: var(--accent-bg-med); }
 
+  .ssh-key-section {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: #0b0e14;
+  }
+  .ssh-key-header {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .ssh-key-form {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 10px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg-base);
+  }
+  .key-textarea {
+    min-height: 140px; resize: vertical; line-height: 1.35;
+  }
+  .ssh-key-list {
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .ssh-key-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 6px; border-radius: 5px;
+  }
+  .ssh-key-row:hover { background: var(--bg-elevated); }
+  .ssh-key-name {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--text-primary); min-width: 96px;
+  }
+  .ssh-key-path {
+    font-family: 'JetBrains Mono', monospace; font-size: 9px;
+    color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    flex: 1;
+  }
+
   .host-form {
     background: #0b0e14; border: 1px solid var(--border); border-radius: 8px;
     padding: 12px; display: flex; flex-direction: column; gap: 10px;
@@ -3195,6 +3209,27 @@
   }
   .host-toggle input { accent-color: var(--accent); }
   .toggle-label { font-size: 11px; color: var(--text-secondary); }
+
+  .host-type-toggle {
+    display: inline-flex; gap: 2px; padding: 2px;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--bg-base);
+    align-self: flex-start;
+  }
+  .host-type-btn {
+    padding: 4px 12px; border-radius: 4px; border: none;
+    background: transparent; color: var(--text-secondary); font-size: 11px;
+    font-family: 'JetBrains Mono', monospace; cursor: pointer;
+  }
+  .host-type-btn:hover { color: var(--text-primary); }
+  .host-type-btn.active { background: var(--accent-bg-med); color: var(--accent); }
+
+  .docker-container-actions {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .docker-selected {
+    font-size: 10px; color: var(--text-secondary);
+    font-family: 'JetBrains Mono', monospace;
+  }
 
   .host-group { margin-bottom: 4px; }
   .host-group-label {
@@ -3231,6 +3266,7 @@
   .host-badge.error-badge { background: var(--danger-bg); color: var(--danger); }
   .host-badge.tmux-badge { background: var(--success-bg); color: var(--success); }
   .host-badge.no-tmux-badge { background: var(--warning-bg); color: var(--warning); }
+  .host-badge.docker-badge { background: rgba(61,139,253,0.12); color: #61afef; }
   .host-badge.testing-badge { background: var(--accent-bg-med); color: var(--accent); animation: pulse 1s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
@@ -3251,6 +3287,25 @@
   .host-loading, .host-empty {
     display: flex; flex-direction: column; align-items: center;
     gap: 12px; padding: 32px; color: var(--text-muted); font-size: 12px;
+  }
+  .host-empty.compact { padding: 10px; }
+  .mobile-empty-pane {
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    background: #0b0e11;
+  }
+  .add-session-btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-radius: 6px;
+    border: 1px solid rgba(249,115,22,0.28);
+    background: rgba(249,115,22,0.08); color: var(--accent, #F97316);
+    font-size: 13px; font-family: 'DM Sans', sans-serif; cursor: pointer;
+  }
+  .add-session-btn:hover { background: rgba(249,115,22,0.14); border-color: var(--accent, #F97316); }
+  .add-session-plus {
+    width: 18px; height: 18px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid currentColor; font-size: 14px; line-height: 1;
   }
 
   /* Field select styling */
@@ -3302,6 +3357,26 @@
   .session-host-tab:hover { color: var(--text-primary); }
   .session-host-tab.active { color: var(--accent); background: var(--accent-bg); border-color: var(--accent-border); }
   .session-host-cnt { font-size: 9px; color: var(--text-muted); }
+  .session-host-error-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--danger); box-shadow: 0 0 6px rgba(240,113,120,0.45);
+  }
+  .session-host-error-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border: 1px solid var(--danger-border);
+    border-radius: 6px; background: var(--danger-bg-subtle);
+  }
+  .session-host-error-main {
+    flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;
+  }
+  .session-host-error-title {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: var(--danger); font-weight: 600;
+  }
+  .session-host-error-message {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--text-secondary); white-space: normal; overflow-wrap: anywhere; line-height: 1.45;
+  }
 
   /* Setup wizard */
   .setup-overlay {
@@ -3397,53 +3472,6 @@
   }
   .setup-preset-desc { font-size: 10px; color: var(--text-muted); }
 
-  /* Command palette */
-  .palette-overlay {
-    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(10,14,20,0.6); backdrop-filter: blur(4px);
-    z-index: 5500; display: flex; align-items: flex-start; justify-content: center;
-    padding-top: 15vh;
-  }
-  .palette {
-    width: 520px; max-width: 90vw; max-height: 60vh;
-    background: var(--bg-raised); border: 1px solid var(--border-strong);
-    border-radius: 12px; box-shadow: 0 24px 64px rgba(0,0,0,0.6);
-    display: flex; flex-direction: column; overflow: hidden;
-  }
-  .palette-input-row {
-    display: flex; align-items: center; gap: 8px;
-    padding: 12px 16px; border-bottom: 1px solid var(--border);
-  }
-  .palette-icon { font-size: 14px; color: var(--text-muted); }
-  .palette-input {
-    flex: 1; background: none; border: none; color: var(--text-primary);
-    font-size: 15px; font-family: 'DM Sans', sans-serif; outline: none;
-  }
-  .palette-input::placeholder { color: var(--text-muted); }
-  .palette-results {
-    flex: 1; overflow-y: auto; padding: 4px;
-  }
-  .palette-item {
-    width: 100%; padding: 8px 12px; border: none; background: transparent;
-    display: flex; align-items: center; gap: 10px; cursor: pointer;
-    border-radius: 6px; font-size: 13px; text-align: left;
-    color: var(--text-primary); transition: background 0.08s;
-  }
-  .palette-item:hover, .palette-item.active { background: var(--bg-elevated); }
-  .palette-category {
-    font-size: 9px; color: var(--text-muted); text-transform: uppercase;
-    letter-spacing: 0.5px; font-weight: 600; min-width: 60px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .palette-label { flex: 1; }
-  .palette-hint {
-    font-size: 10px; padding: 2px 6px; border-radius: 3px;
-    background: var(--bg-base); border: 1px solid var(--border);
-    color: var(--text-secondary); font-family: 'JetBrains Mono', monospace;
-  }
-  .palette-empty {
-    padding: 24px; text-align: center; color: var(--text-muted); font-size: 12px;
-  }
   /* ---- Mobile minimap ---- */
   .minimap-container {
     flex: 1; display: flex; flex-direction: column;
@@ -3555,9 +3583,6 @@
     .auth-logout { display: none; }
     .spacer { flex: 0; }
 
-    /* Hide properties panel on mobile */
-    .props-panel { display: none; }
-
     /* Compact status bar */
     .statusbar { height: 20px; padding: 0 8px; font-size: 9px; }
 
@@ -3569,6 +3594,5 @@
     /* Tablet: slightly compact */
     .topnav { padding: 0 8px; }
     .wt { padding: 4px 10px; font-size: 11px; }
-    .props-panel { width: 220px; }
   }
 </style>
