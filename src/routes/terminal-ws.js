@@ -8,7 +8,7 @@ import { hasUsers } from '../lib/auth.js';
 import { DEFAULT_HOST } from '../lib/constants.js';
 import { noStoreResponse } from '../lib/response-headers.js';
 import { assertTerminalSessionName, normalizeTerminalSize } from '../lib/terminal-utils.js';
-import { authorizeWebSocketRequest, createWsTokenStore, isTerminalWsMessageTooLarge, logRejectedWebSocket, parseTerminalWsMessage, terminalExitReason, wsCloseReason } from '../lib/ws-utils.js';
+import { authorizeWebSocketRequest, createTerminalScrollScheduler, createWsTokenStore, isTerminalWsMessageTooLarge, logRejectedWebSocket, parseTerminalWsMessage, terminalExitReason, wsCloseReason } from '../lib/ws-utils.js';
 
 const wsTokenStore = createWsTokenStore();
 export const WS_TOKEN_RATE_LIMIT_MAX = 120;
@@ -75,6 +75,11 @@ export default async function terminalWsRoutes(fastify) {
     const { pty: term, id } = terminal;
     const startedAt = Date.now();
     let recentOutput = '';
+    let targetHost;
+    const scrollScheduler = createTerminalScrollScheduler(async (lines) => {
+      targetHost ??= findHost(fastify.db, host) || { name: host, isLocal: true, connectionType: 'ssh' };
+      await scrollSession(targetHost, session, lines);
+    });
 
     fastify.log.info({ id, session, host }, 'Terminal PTY spawned');
 
@@ -123,8 +128,8 @@ export default async function terminalWsRoutes(fastify) {
         return;
       }
       if (msg.type === 'scroll') {
-        const targetHost = findHost(fastify.db, host) || { name: host, isLocal: true, connectionType: 'ssh' };
-        scrollSession(targetHost, session, msg.lines).catch((err) => {
+        scrollScheduler.push(msg.lines);
+        scrollScheduler.flushNow().catch((err) => {
           fastify.log.warn({ err, session, host }, 'Failed to scroll terminal session');
         });
         return;
@@ -144,12 +149,14 @@ export default async function terminalWsRoutes(fastify) {
     // WebSocket close → kill PTY + remove from status engine
     socket.on('close', () => {
       fastify.log.info({ id, session }, 'Terminal WebSocket closed');
+      scrollScheduler.stop();
       statusEngine.remove(id);
       killTerminal(id);
     });
 
     socket.on('error', (err) => {
       fastify.log.error({ id, session, err: err.message }, 'Terminal WebSocket error');
+      scrollScheduler.stop();
       statusEngine.remove(id);
       killTerminal(id);
     });

@@ -59,6 +59,7 @@ test('tmux scroll and capture reject invalid session names before execution', as
     () => captureSession(host, 'bad/name'),
     Object.assign(/Invalid session name/, { statusCode: 400 })
   );
+
 });
 
 test('tmux send-lines rejects invalid session names before execution', async () => {

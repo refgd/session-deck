@@ -1,6 +1,7 @@
 <script>
   import SettingsDropdown from './SettingsDropdown.svelte';
   import { translate } from './i18n.js';
+  import { appPath } from './base-path.js';
 
   let {
     language = 'en',
@@ -39,7 +40,7 @@
 <nav class="topnav">
   <div class="logo-wrap">
     <button class="logo" onclick={toggleSettings} title={t('settings')}>
-      <img class="logo-icon" src="/icon.svg" alt="" width="18" height="18" />
+      <img class="logo-icon" src={appPath('/icon.svg')} alt="" width="18" height="18" />
       <span class="logo-text">Session<b>Deck</b></span>
     </button>
     {#if showSettingsMenu}
@@ -78,7 +79,7 @@
   {/if}
   {#if authUser}
     <span class="auth-user">{authUser.name}</span>
-    <form class="auth-logout-form" method="POST" action="/auth/logout">
+    <form class="auth-logout-form" method="POST" action={appPath('/auth/logout')}>
       <button class="auth-logout" type="submit" title={t('signOut')}>{t('signOut')}</button>
     </form>
   {/if}

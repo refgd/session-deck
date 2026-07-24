@@ -11,6 +11,7 @@ import { escapeHtml, hashPasswordSync, verifyPassword } from './auth-utils.js';
 import { validateNewCredentials } from './credentials.js';
 import { redactPath } from './path-redaction.js';
 import { noStoreResponse } from './response-headers.js';
+import { externalPath } from './base-path.js';
 
 const { auth } = config;
 export const MAX_LOGIN_FAILURES = 5;
@@ -47,7 +48,7 @@ export async function registerAuth(fastify) {
         return apiError(reply, 'Setup required', 428, { setupRequired: true });
       }
       request.session.returnTo = safeReturnTo(request.url);
-      return reply.redirect('/auth/setup');
+      return reply.redirect(externalPath(request, '/auth/setup'));
     }
 
     if (request.session?.authenticated) return;
@@ -57,7 +58,7 @@ export async function registerAuth(fastify) {
     }
 
     request.session.returnTo = safeReturnTo(request.url);
-    reply.redirect('/auth/login');
+    reply.redirect(externalPath(request, '/auth/login'));
   });
 
   fastify.log.info('Password auth enabled');
@@ -128,39 +129,39 @@ async function bootstrapUserIfConfigured(fastify) {
 async function registerLocalAuthRoutes(fastify) {
   fastify.get('/auth/setup', async (request, reply) => {
     noStoreAuthResponse(reply);
-    if (hasUsers(fastify.db)) return reply.redirect('/auth/login');
-    reply.type('text/html').send(authPage({ mode: 'setup' }));
+    if (hasUsers(fastify.db)) return reply.redirect(externalPath(request, '/auth/login'));
+    reply.type('text/html').send(authPage({ mode: 'setup', basePath: externalPath(request, '/') }));
   });
 
   fastify.post('/auth/setup', {
     config: { rateLimit: { max: 10, timeWindow: '5 minutes' } },
   }, async (request, reply) => {
     noStoreAuthResponse(reply);
-    if (hasUsers(fastify.db)) return reply.redirect('/auth/login');
+    if (hasUsers(fastify.db)) return reply.redirect(externalPath(request, '/auth/login'));
     const { username, password, confirmPassword } = request.body || {};
     const validation = validateNewCredentials(username, password, confirmPassword);
     if (validation) {
-      return reply.type('text/html').send(authPage({ mode: 'setup', error: validation, username }));
+      return reply.type('text/html').send(authPage({ mode: 'setup', error: validation, username, basePath: externalPath(request, '/') }));
     }
 
     createUser(fastify.db, username.trim(), password);
     request.session.authenticated = true;
     request.session.user = { name: username.trim(), method: 'password' };
-    reply.redirect('/');
+    reply.redirect(externalPath(request, '/'));
   });
 
   fastify.get('/auth/login', async (request, reply) => {
     noStoreAuthResponse(reply);
-    if (!hasUsers(fastify.db)) return reply.redirect('/auth/setup');
-    if (request.session?.authenticated) return reply.redirect('/');
-    reply.type('text/html').send(authPage({ mode: 'login' }));
+    if (!hasUsers(fastify.db)) return reply.redirect(externalPath(request, '/auth/setup'));
+    if (request.session?.authenticated) return reply.redirect(externalPath(request, '/'));
+    reply.type('text/html').send(authPage({ mode: 'login', basePath: externalPath(request, '/') }));
   });
 
   fastify.post('/auth/login', {
     config: { rateLimit: { max: 10, timeWindow: '5 minutes' } },
   }, async (request, reply) => {
     noStoreAuthResponse(reply);
-    if (!hasUsers(fastify.db)) return reply.redirect('/auth/setup');
+    if (!hasUsers(fastify.db)) return reply.redirect(externalPath(request, '/auth/setup'));
     const { username, password } = request.body || {};
     const attemptKey = loginAttemptKey(request, username);
     const locked = loginAttempts.check(attemptKey);
@@ -172,6 +173,7 @@ async function registerLocalAuthRoutes(fastify) {
           mode: 'login',
           error: `Too many failed login attempts. Try again in ${locked.retryAfterSeconds} seconds.`,
           username,
+          basePath: externalPath(request, '/'),
         }));
     }
 
@@ -183,16 +185,16 @@ async function registerLocalAuthRoutes(fastify) {
       fastify.db.prepare("UPDATE app_users SET last_login_at = datetime('now') WHERE id = ?").run(user.id);
       const returnTo = safeReturnTo(request.session.returnTo);
       delete request.session.returnTo;
-      return reply.redirect(returnTo);
+      return reply.redirect(externalPath(request, returnTo));
     }
     loginAttempts.recordFailure(attemptKey);
-    reply.type('text/html').send(authPage({ mode: 'login', error: 'Invalid username or password', username }));
+    reply.type('text/html').send(authPage({ mode: 'login', error: 'Invalid username or password', username, basePath: externalPath(request, '/') }));
   });
 
   fastify.post('/auth/logout', async (request, reply) => {
     noStoreAuthResponse(reply);
     request.session.destroy();
-    reply.redirect('/auth/login');
+    reply.redirect(externalPath(request, '/auth/login'));
   });
 
   fastify.get('/auth/me', async (request, reply) => {
@@ -279,15 +281,17 @@ function createUser(db, username, password) {
   db.prepare('INSERT INTO app_users (username, password_hash) VALUES (?, ?)').run(username, hash);
 }
 
-function authPage({ mode, error = null, username = '' }) {
+function authPage({ mode, error = null, username = '', basePath = '/' }) {
   const setup = mode === 'setup';
+  const base = String(basePath || '/').replace(/\/$/, '');
+  const path = (suffix) => `${base}${suffix}`;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Session Deck — ${setup ? 'Setup' : 'Login'}</title>
-  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/png" href="${path('/favicon.png')}">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -331,12 +335,12 @@ function authPage({ mode, error = null, username = '' }) {
 <body>
   <div class="login-card">
     <div class="login-logo">
-      <img src="/icon.svg" width="32" height="32" alt="Session Deck">
+      <img src="${path('/icon.svg')}" width="32" height="32" alt="Session Deck">
       <span class="login-title">SESSION DECK</span>
     </div>
     <p class="login-subtitle">${setup ? 'Create the first administrator account.' : 'Sign in with your local account.'}</p>
     ${error ? `<div class="login-error">${escapeHtml(error)}</div>` : ''}
-    <form class="login-form" method="POST" action="${setup ? '/auth/setup' : '/auth/login'}">
+    <form class="login-form" method="POST" action="${setup ? path('/auth/setup') : path('/auth/login')}">
       <input class="login-field" type="text" name="username" placeholder="Username" value="${escapeHtml(username || '')}" required autofocus>
       <input class="login-field" type="password" name="password" placeholder="Password" required>
       ${setup ? '<input class="login-field" type="password" name="confirmPassword" placeholder="Confirm password" required>' : ''}

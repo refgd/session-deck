@@ -1,5 +1,6 @@
 <script>
   import { translate } from './i18n.js';
+  import { appPath } from './base-path.js';
 
   let {
     language = 'en',
@@ -57,7 +58,7 @@
     </div>
   </div>
   <div class="help-about">
-    <img class="help-about-icon" src="/icon.svg" alt="Session Deck" width="48" height="48" />
+    <img class="help-about-icon" src={appPath('/icon.svg')} alt="Session Deck" width="48" height="48" />
     <span class="help-about-title">Session Deck</span>
     <span class="help-about-desc">{t('webTmuxManager')}</span>
     <span class="help-about-version">v0.1.0</span>

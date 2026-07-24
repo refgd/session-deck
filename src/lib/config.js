@@ -11,6 +11,7 @@ export function createConfig(env = process.env) {
     host: env.SESSION_DECK_HOST || '0.0.0.0',
     logLevel: env.SESSION_DECK_LOG_LEVEL || 'info',
     dbPath: env.SESSION_DECK_DB_PATH || './data/session-deck.db',
+    basePath: parseBasePath(env.SESSION_DECK_BASE_PATH || ''),
     bodyLimit: parseIntegerEnv(env.SESSION_DECK_BODY_LIMIT, DEFAULT_BODY_LIMIT),
     corsOrigins: parseCorsOrigins(env.SESSION_DECK_CORS_ORIGINS || ''),
     trustProxy: parseBooleanEnv(env.SESSION_DECK_TRUST_PROXY, false),
@@ -55,6 +56,10 @@ function validateConfig(config, env = process.env) {
     throw new Error(`Invalid SESSION_DECK_HTTPS: ${env.SESSION_DECK_HTTPS}`);
   }
 
+  if (config.basePath === null) {
+    throw new Error(`Invalid SESSION_DECK_BASE_PATH: ${env.SESSION_DECK_BASE_PATH}`);
+  }
+
   if ((config.auth.bootstrapUser && !config.auth.bootstrapPass) || (!config.auth.bootstrapUser && config.auth.bootstrapPass)) {
     throw new Error('SESSION_DECK_AUTH_USER and SESSION_DECK_AUTH_PASS must be set together');
   }
@@ -89,6 +94,13 @@ function parseHttpsMode(value) {
   if (['1', 'true', 'yes', 'on'].includes(text)) return true;
   if (['0', 'false', 'no', 'off'].includes(text)) return false;
   return null;
+}
+
+function parseBasePath(value) {
+  const text = String(value || '').trim();
+  if (!text || text === '/') return '';
+  if (!/^\/[A-Za-z0-9._~/-]*$/.test(text)) return null;
+  return `/${text.replace(/^\/+|\/+$/g, '')}`;
 }
 
 function parseCorsOrigins(value) {

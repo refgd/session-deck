@@ -94,10 +94,24 @@ export function validateRequestOrigin(request) {
 }
 
 function requestExpectedOrigin(request) {
-  const host = String(request?.headers?.host || '').trim();
+  const host = forwardedHeaderValue(request?.headers?.['x-forwarded-host']) ||
+    String(request?.headers?.host || '').trim();
   if (!host) return null;
-  const protocol = request?.protocol || 'http';
+  const protocol = forwardedProtocol(request) || request?.protocol || 'http';
   return normalizeOrigin(`${protocol}://${host}`);
+}
+
+function forwardedProtocol(request) {
+  const proto = forwardedHeaderValue(request?.headers?.['x-forwarded-proto']);
+  if (proto === 'http' || proto === 'https') return proto;
+  return null;
+}
+
+function forwardedHeaderValue(value) {
+  return String(Array.isArray(value) ? value[0] : value || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
 }
 
 function normalizeOrigin(value) {

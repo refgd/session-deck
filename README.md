@@ -130,6 +130,7 @@ npm run test:integration
 | `SESSION_DECK_SESSION_MAX_AGE` | `86400` | Session cookie max age in seconds |
 | `SESSION_DECK_HTTPS` | `auto` | `auto`, `true`, or `false`. Auto enables HTTPS-only headers for HTTPS requests while keeping local HTTP usable |
 | `SESSION_DECK_TRUST_PROXY` | `false` | Trust `X-Forwarded-*` headers; enable only behind a trusted reverse proxy |
+| `SESSION_DECK_BASE_PATH` | — | Optional public subdirectory such as `/deck`; can also be supplied per request with `X-Forwarded-Prefix` |
 
 ### Authentication
 
@@ -155,6 +156,32 @@ If `SESSION_DECK_SESSION_SECRET` is omitted, Session Deck generates a random per
 - Mounting `/var/run/docker.sock` enables Docker container support, but it effectively grants control over the host Docker daemon to authenticated Session Deck users.
 - Managed SSH private keys are stored under the data directory with `0600` permissions. Keep the `data/` directory private and out of source control.
 - The app has no anonymous mode: first launch requires account setup, and all API/WebSocket routes require authentication after setup.
+
+### Reverse Proxy Subdirectory
+
+Session Deck can run behind a path prefix such as `/deck/`. With nginx stripping the prefix through `proxy_pass http://localhost:7890/`, pass the public prefix so login redirects, forms, API calls, WebSockets, icons, and service worker paths stay under `/deck`.
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+location /deck/ {
+    proxy_pass http://localhost:7890/;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Prefix /deck;
+
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+}
+```
+
+For deployments where nginx cannot set `X-Forwarded-Prefix`, set `SESSION_DECK_BASE_PATH=/deck` on the Session Deck process instead.
 
 ### Run as a systemd Service
 

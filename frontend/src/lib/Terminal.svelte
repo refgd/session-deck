@@ -10,6 +10,7 @@
   import { DEFAULT_HOST } from './constants.js';
   import { paneSessionKey } from './pane-key-utils.js';
   import { canSendTerminalInput, terminalInputModeLabel } from './terminal-input-utils.js';
+  import { appPath, websocketPath } from './base-path.js';
 
   const WS_TOKEN_PROTOCOL_PREFIX = 'sessiondeck.ws-token.';
 
@@ -35,6 +36,8 @@
   let suppressTimer;
   let prevSession;
   let prevHost;
+  let pendingScrollLines = 0;
+  let scrollFlushTimer;
   let connected = $state(false);
   let connecting = $state(false);
   let error = $state(null);
@@ -58,10 +61,8 @@
     error = null;
 
     // Fetch a short-lived WS auth token, then connect
-    fetch('/api/ws-token').then(r => r.json()).then(({ token }) => {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${proto}//${window.location.host}/ws/terminal?session=${encodeURIComponent(session)}&host=${encodeURIComponent(host)}&cols=${term.cols}&rows=${term.rows}`;
-
+    fetch(appPath('/api/ws-token')).then(r => r.json()).then(({ token }) => {
+      const wsUrl = websocketPath(`/ws/terminal?session=${encodeURIComponent(session)}&host=${encodeURIComponent(host)}&cols=${term.cols}&rows=${term.rows}`);
       ws = new WebSocket(wsUrl, [`${WS_TOKEN_PROTOCOL_PREFIX}${token}`]);
 
       ws.onopen = () => {
@@ -126,6 +127,8 @@
   function disconnect() {
     clearTimeout(resizeTimer);
     clearTimeout(suppressTimer);
+    flushPendingScroll();
+    clearTimeout(scrollFlushTimer);
     if (ws) {
       ws.onclose = null; // Prevent reconnect on intentional close
       ws.close(1000, 'Client disconnect');
@@ -159,8 +162,28 @@
   function sendScroll(lines) {
     if (!Number.isFinite(lines) || lines === 0) return;
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'scroll', lines }));
+      pendingScrollLines = clampScrollLines(pendingScrollLines + lines);
+      if (!pendingScrollLines || scrollFlushTimer) return;
+      scrollFlushTimer = setTimeout(flushPendingScroll, 40);
     }
+  }
+
+  function flushPendingScroll() {
+    clearTimeout(scrollFlushTimer);
+    scrollFlushTimer = null;
+    if (!pendingScrollLines || !ws || ws.readyState !== WebSocket.OPEN) {
+      pendingScrollLines = 0;
+      return;
+    }
+    const lines = pendingScrollLines;
+    pendingScrollLines = 0;
+    ws.send(JSON.stringify({ type: 'scroll', lines }));
+  }
+
+  function clampScrollLines(lines) {
+    if (!Number.isFinite(lines) || lines === 0) return 0;
+    const magnitude = Math.min(200, Math.max(1, Math.floor(Math.abs(lines))));
+    return lines > 0 ? magnitude : -magnitude;
   }
 
   onMount(() => {

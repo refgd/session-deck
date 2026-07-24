@@ -5,6 +5,7 @@ import {
   WS_POLICY_CLOSE_CODE,
   authorizeWebSocketRequest,
   cleanTerminalOutput,
+  createTerminalScrollScheduler,
   createWsTokenStore,
   extractWebSocketToken,
   isTerminalWsMessageTooLarge,
@@ -376,4 +377,60 @@ test('normalizeTerminalScrollLines clamps finite values while preserving directi
   assert.equal(normalizeTerminalScrollLines(1.8), 1);
   assert.equal(normalizeTerminalScrollLines(0), 0);
   assert.equal(normalizeTerminalScrollLines(Number.POSITIVE_INFINITY), 0);
+});
+
+test('createTerminalScrollScheduler coalesces and clamps scroll bursts', async () => {
+  const calls = [];
+  const timers = [];
+  const scheduler = createTerminalScrollScheduler(async (lines) => {
+    calls.push(lines);
+  }, {
+    maxLines: 50,
+    setTimeoutRef(fn) {
+      timers.push(fn);
+      return fn;
+    },
+    clearTimeoutRef() {},
+  });
+
+  scheduler.push(-10);
+  scheduler.push(-15);
+  scheduler.push(-100);
+
+  assert.equal(timers.length, 1);
+  await timers.shift()();
+  assert.deepEqual(calls, [-50]);
+});
+
+test('createTerminalScrollScheduler serializes in-flight scroll work', async () => {
+  const calls = [];
+  const timers = [];
+  let release;
+  const firstScroll = new Promise((resolve) => {
+    release = resolve;
+  });
+  const scheduler = createTerminalScrollScheduler(async (lines) => {
+    calls.push(lines);
+    if (calls.length === 1) await firstScroll;
+  }, {
+    setTimeoutRef(fn) {
+      timers.push(fn);
+      return fn;
+    },
+    clearTimeoutRef() {},
+  });
+
+  scheduler.push(20);
+  const firstFlush = timers.shift()();
+  scheduler.push(30);
+  scheduler.push(40);
+
+  assert.deepEqual(calls, [20]);
+  assert.equal(timers.length, 0);
+
+  release();
+  await firstFlush;
+  assert.equal(timers.length, 1);
+  await timers.shift()();
+  assert.deepEqual(calls, [20, 70]);
 });

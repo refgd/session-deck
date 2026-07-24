@@ -157,6 +157,19 @@ test('validateRequestOrigin checks WebSocket-capable request origins', () => {
     protocol: 'https',
   }).ok, true);
   assert.deepEqual(validateRequestOrigin({
+    headers: {
+      origin: 'https://deck.example.com',
+      host: '127.0.0.1:7890',
+      'x-forwarded-proto': 'https',
+      'x-forwarded-host': 'deck.example.com',
+    },
+    protocol: 'http',
+  }), {
+    ok: true,
+    origin: 'https://deck.example.com',
+    expectedOrigin: 'https://deck.example.com',
+  });
+  assert.deepEqual(validateRequestOrigin({
     headers: { origin: 'https://evil.example.com', host: 'deck.example.com' },
     protocol: 'https',
   }), {

@@ -254,4 +254,5 @@ export default async function sessionsRoutes(fastify) {
       return apiError(reply, err, err.statusCode, { host: hostName, session: sessionName });
     }
   });
+
 }

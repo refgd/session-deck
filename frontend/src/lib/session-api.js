@@ -1,8 +1,9 @@
 import { apiJson, apiOk } from './api-client.js';
+import { appPath } from './base-path.js';
 import { formatSessionHostError } from './session-utils.js';
 
 export async function loadHostSessions(hostName, { fetchRef = fetch } = {}) {
-  const res = await fetchRef(`/api/sessions/${encodeURIComponent(hostName)}`);
+  const res = await fetchRef(appPath(`/api/sessions/${encodeURIComponent(hostName)}`));
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(formatSessionHostError(hostName, data, res));
   if (data.status && data.status !== 'online') {
@@ -39,5 +40,5 @@ export async function runSessionRenderTest(host, session, { api = apiOk } = {}) 
 }
 
 export function sessionCaptureDownloadPath(host, session) {
-  return `/api/sessions/${encodeURIComponent(host)}/${encodeURIComponent(session)}/capture?download=true`;
+  return appPath(`/api/sessions/${encodeURIComponent(host)}/${encodeURIComponent(session)}/capture?download=true`);
 }

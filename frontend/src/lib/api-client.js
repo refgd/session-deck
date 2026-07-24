@@ -1,3 +1,5 @@
+import { appPath } from './base-path.js';
+
 export async function apiJson(path, options = {}) {
   const { body, headers, ...rest } = options;
   const init = { ...rest, headers: new Headers(headers || {}) };
@@ -7,7 +9,7 @@ export async function apiJson(path, options = {}) {
     if (!init.headers.has('Content-Type')) init.headers.set('Content-Type', 'application/json');
   }
 
-  const res = await fetch(path, init).catch((err) => {
+  const res = await fetch(appPath(path), init).catch((err) => {
     const message = err?.message || 'Network request failed';
     const next = new Error(`Network request failed: ${message}`);
     next.status = 0;

@@ -244,6 +244,45 @@ test('login redirects only to sanitized returnTo paths', async () => {
   }
 });
 
+test('auth redirects and forms honor reverse proxy forwarded prefix', async () => {
+  const app = await buildAuthServer();
+  try {
+    app.db.prepare(
+      'INSERT INTO app_users (username, password_hash) VALUES (?, ?)'
+    ).run('admin', hashPasswordSync('password123'));
+
+    const loginPage = await app.inject({
+      url: '/dashboard',
+      headers: { 'x-forwarded-prefix': '/deck' },
+    });
+    const cookie = cookieHeader(loginPage);
+    assert.equal(loginPage.statusCode, 302);
+    assert.equal(loginPage.headers.location, '/deck/auth/login');
+
+    const form = await app.inject({
+      url: '/auth/login',
+      headers: { 'x-forwarded-prefix': '/deck' },
+    });
+    assert.match(form.body, /action="\/deck\/auth\/login"/);
+    assert.match(form.body, /src="\/deck\/icon\.svg"/);
+
+    const login = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      headers: { cookie, 'x-forwarded-prefix': '/deck' },
+      payload: {
+        username: 'admin',
+        password: 'password123',
+      },
+    });
+
+    assert.equal(login.statusCode, 302);
+    assert.equal(login.headers.location, '/deck/dashboard');
+  } finally {
+    await app.close();
+  }
+});
+
 test('auth pages and session status are not cached', async () => {
   const app = await buildAuthServer();
   try {

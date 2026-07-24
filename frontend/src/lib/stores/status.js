@@ -5,6 +5,7 @@
 // Also fires browser notifications when a background pane transitions to "asking".
 
 import { paneSessionKey } from '../pane-key-utils.js';
+import { appPath, websocketPath } from '../base-path.js';
 
 let _ws = null;
 let _reconnectTimer = null;
@@ -76,10 +77,7 @@ export function requestNotificationPermission() {
 export function startStatusConnection() {
   if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) return;
 
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${proto}//${window.location.host}/ws/status`;
-
-  _ws = new WebSocket(wsUrl);
+  _ws = new WebSocket(websocketPath('/ws/status'));
   const currentSocket = _ws;
 
   _ws.onopen = () => {
@@ -173,7 +171,7 @@ function fireNotification(session, host) {
     const body = `${session}@${host} needs attention`;
     const n = new Notification(title, {
       body,
-      icon: '/icons/icon-192.png',
+      icon: appPath('/icons/icon-192.png'),
       tag: `asking-${host}-${session}`, // dedupe repeated notifications for same pane
       renotify: true,
     });

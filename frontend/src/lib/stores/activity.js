@@ -4,6 +4,7 @@
 import { getWorkspaces, getActiveId } from './workspaces.js';
 import { getSessionPanes } from './layout.js';
 import { paneSessionKey } from '../pane-key-utils.js';
+import { appPath } from '../base-path.js';
 
 let _pollTimer = null;
 let _listeners = [];
@@ -59,7 +60,7 @@ export function markWorkspaceSeen(workspaceId) {
  */
 async function pollActivity() {
   try {
-    const res = await fetch('/api/activity');
+    const res = await fetch(appPath('/api/activity'));
     if (!res.ok) return;
     const data = await res.json();
 

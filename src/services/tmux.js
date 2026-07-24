@@ -324,6 +324,15 @@ export async function scrollSession(host, sessionName, lines) {
   await execTmux(host, ['send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
 }
 
+/**
+ * Capture rendered scrollback for the active pane in a tmux session.
+ * This is used to hydrate the browser's local xterm scrollback before attach.
+ * @param {object} host
+ * @param {string} sessionName
+ * @param {object} [options]
+ * @param {number} [options.lines=5000]
+ * @returns {Promise<string>}
+ */
 export async function sendLinesToSession(host, sessionName, lines, options = {}) {
   assertValidSessionName(sessionName);
   const delayMs = Number.isFinite(options.delayMs) ? Math.max(0, options.delayMs) : 50;

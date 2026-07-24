@@ -11,6 +11,7 @@ test('createConfig applies stable defaults', () => {
   assert.equal(config.bodyLimit, DEFAULT_BODY_LIMIT);
   assert.equal(config.trustProxy, false);
   assert.equal(config.https, 'auto');
+  assert.equal(config.basePath, '');
   assert.deepEqual(config.corsOrigins, []);
   assert.deepEqual(config.auth, {
     bootstrapUser: '',
@@ -34,6 +35,7 @@ test('createConfig parses explicit environment values', () => {
     SESSION_DECK_CORS_ORIGINS: 'http://localhost:5173,https://deck.example.com',
     SESSION_DECK_TRUST_PROXY: 'true',
     SESSION_DECK_HTTPS: 'true',
+    SESSION_DECK_BASE_PATH: '/deck/',
   });
 
   assert.equal(config.port, 3000);
@@ -48,6 +50,7 @@ test('createConfig parses explicit environment values', () => {
   assert.deepEqual(config.corsOrigins, ['http://localhost:5173', 'https://deck.example.com']);
   assert.equal(config.trustProxy, true);
   assert.equal(config.https, true);
+  assert.equal(config.basePath, '/deck');
 });
 
 test('createConfig parses automatic and disabled HTTPS modes', () => {
@@ -74,4 +77,6 @@ test('createConfig rejects invalid environment combinations', () => {
   assert.throws(() => createConfig({ SESSION_DECK_CORS_ORIGINS: 'file:///tmp/deck' }), /Invalid SESSION_DECK_CORS_ORIGINS origin/);
   assert.throws(() => createConfig({ SESSION_DECK_TRUST_PROXY: 'maybe' }), /Invalid SESSION_DECK_TRUST_PROXY/);
   assert.throws(() => createConfig({ SESSION_DECK_HTTPS: 'maybe' }), /Invalid SESSION_DECK_HTTPS/);
+  assert.throws(() => createConfig({ SESSION_DECK_BASE_PATH: 'deck' }), /Invalid SESSION_DECK_BASE_PATH/);
+  assert.throws(() => createConfig({ SESSION_DECK_BASE_PATH: '/deck?<bad>' }), /Invalid SESSION_DECK_BASE_PATH/);
 });

@@ -4,6 +4,7 @@ import { normalizeTerminalSize } from './terminal-utils.js';
 
 export const MAX_TERMINAL_WS_MESSAGE_BYTES = 64 * 1024;
 export const MAX_TERMINAL_SCROLL_LINES = 200;
+export const TERMINAL_SCROLL_FLUSH_MS = 40;
 export const WS_POLICY_CLOSE_CODE = 1008;
 export const WS_TOKEN_PROTOCOL_PREFIX = 'sessiondeck.ws-token.';
 
@@ -218,6 +219,67 @@ export function normalizeTerminalScrollLines(value, maxLines = MAX_TERMINAL_SCRO
   const limit = Number.isFinite(maxLines) && maxLines > 0 ? Math.floor(maxLines) : MAX_TERMINAL_SCROLL_LINES;
   const magnitude = Math.min(limit, Math.max(1, Math.floor(Math.abs(lines))));
   return lines > 0 ? magnitude : -magnitude;
+}
+
+export function createTerminalScrollScheduler(scrollFn, options = {}) {
+  const flushMs = Number.isFinite(options.flushMs) && options.flushMs >= 0
+    ? options.flushMs
+    : TERMINAL_SCROLL_FLUSH_MS;
+  const maxLines = Number.isFinite(options.maxLines) && options.maxLines > 0
+    ? Math.floor(options.maxLines)
+    : MAX_TERMINAL_SCROLL_LINES;
+  const setTimeoutRef = options.setTimeoutRef || setTimeout;
+  const clearTimeoutRef = options.clearTimeoutRef || clearTimeout;
+
+  let pendingLines = 0;
+  let timer = null;
+  let inFlight = false;
+  let stopped = false;
+
+  const clamp = (lines) => normalizeTerminalScrollLines(lines, maxLines);
+
+  async function flush() {
+    timer = null;
+    if (stopped || inFlight) return;
+
+    const lines = clamp(pendingLines);
+    pendingLines = 0;
+    if (!lines) return;
+
+    inFlight = true;
+    try {
+      await scrollFn(lines);
+    } finally {
+      inFlight = false;
+      if (!stopped && pendingLines) schedule();
+    }
+  }
+
+  function schedule() {
+    if (timer || inFlight || stopped) return;
+    timer = setTimeoutRef(flush, flushMs);
+  }
+
+  return {
+    push(lines) {
+      if (stopped) return;
+      pendingLines = clamp(pendingLines + Number(lines || 0));
+      if (pendingLines) schedule();
+    },
+    flushNow() {
+      if (timer) {
+        clearTimeoutRef(timer);
+        timer = null;
+      }
+      return flush();
+    },
+    stop() {
+      stopped = true;
+      pendingLines = 0;
+      if (timer) clearTimeoutRef(timer);
+      timer = null;
+    },
+  };
 }
 
 function normalizeControlSize(msg) {
