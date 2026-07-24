@@ -91,7 +91,7 @@
   let managedHosts = $state([]);
   let managedHostsLoading = $state(false);
   let hostEditMode = $state(null); // null | 'add' | host.id (editing)
-  let hostForm = $state({ name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true, connection_type: 'ssh', docker_container: '' });
+  let hostForm = $state({ name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true, connection_type: 'ssh', docker_container: '', gateway_host_id: '' });
   let hostDeleteConfirm = $state(null); // host id
   let dockerContainers = $state([]);
   let dockerContainersLoading = $state(false);
@@ -760,6 +760,9 @@
     if (section === 'appearance') {
       loadSessionTypes();
     }
+    if (section === 'keys') {
+      loadSshKeys();
+    }
   }
 
   function closeSettingsPanel() {
@@ -792,7 +795,7 @@
   }
 
   function settingsSectionTitle(section) {
-    const titles = { servers: t('servers'), sessions: t('sessions'), appearance: t('appearance'), help: t('help') };
+    const titles = { servers: t('servers'), keys: t('sshKeys'), sessions: t('sessions'), appearance: t('appearance'), help: t('help') };
     return titles[section] || '';
   }
 
@@ -890,7 +893,7 @@
 
   function startAddHost() {
     hostEditMode = 'add';
-    hostForm = { name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true, connection_type: 'ssh', docker_container: '' };
+    hostForm = { name: '', hostname: '', user: '', port: 22, identity_file: '', auth_method: 'key', group_name: 'Other', enabled: true, connection_type: 'ssh', docker_container: '', gateway_host_id: '' };
     loadSshKeys();
   }
 
@@ -907,6 +910,7 @@
       enabled: !!host.enabled,
       connection_type: host.connection_type || (host.auth_method === 'docker' ? 'docker' : 'ssh'),
       docker_container: host.docker_container || '',
+      gateway_host_id: host.gateway_host_id ? String(host.gateway_host_id) : '',
     };
     if (hostForm.connection_type === 'docker') loadDockerContainers();
     else loadSshKeys();
@@ -990,10 +994,11 @@
 
   const HOST_GROUPS = ['Local', 'Docker', 'HomeLab LXC', 'HomeLab VM', 'Proxmox', 'NAS', 'VPS', 'Network', 'Client', 'Other'];
 
-  async function loadDockerContainers() {
+  async function loadDockerContainers(gatewayHostId = hostForm.gateway_host_id) {
     dockerContainersLoading = true;
     try {
-      const res = await fetch('/api/docker/containers');
+      const gatewayQuery = gatewayHostId ? `?gateway_host_id=${encodeURIComponent(gatewayHostId)}` : '';
+      const res = await fetch(`/api/docker/containers${gatewayQuery}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to list Docker containers');
       dockerContainers = data.containers || [];
@@ -1023,6 +1028,15 @@
     hostForm.docker_container = name;
     hostForm.hostname = name;
     if (!hostForm.name.trim()) hostForm.name = name;
+  }
+
+  function setHostGateway(value) {
+    hostForm.gateway_host_id = value;
+    if (hostForm.connection_type === 'docker') {
+      hostForm.docker_container = '';
+      hostForm.hostname = '';
+      loadDockerContainers(value);
+    }
   }
 
   // Host test state
@@ -1794,56 +1808,6 @@
                 </button>
               </div>
 
-              <div class="ssh-key-section">
-                <div class="ssh-key-header">
-                  <span class="appearance-section-title">{t('sshKeys')}</span>
-                  <span class="spacer"></span>
-                  <button class="host-toolbar-btn" onclick={loadSshKeys} disabled={sshKeysLoading}>
-                    {sshKeysLoading ? t('loading') : t('refresh')}
-                  </button>
-                  <button class="host-toolbar-btn primary" onclick={() => showAddKeyForm = !showAddKeyForm}>
-                    {showAddKeyForm ? t('cancel') : t('addSshKey')}
-                  </button>
-                </div>
-                {#if showAddKeyForm}
-                  <div class="ssh-key-form">
-                    <label class="host-field">
-                      <span class="host-field-label">{t('keyName')}</span>
-                      <input class="field-input" bind:value={sshKeyForm.name} placeholder="id_ed25519_prod" />
-                    </label>
-                    <label class="host-field full-width">
-                      <span class="host-field-label">{t('privateKey')}</span>
-                      <textarea class="field-input key-textarea" bind:value={sshKeyForm.privateKey} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
-                    </label>
-                    <label class="host-field full-width">
-                      <span class="host-field-label">{t('publicKeyOptional')}</span>
-                      <input class="field-input" bind:value={sshKeyForm.publicKey} placeholder="ssh-ed25519 ..." />
-                    </label>
-                    <div class="host-form-actions">
-                      <button class="action-btn" onclick={saveSshKey} disabled={!sshKeyForm.name.trim() || !sshKeyForm.privateKey.trim() || sshKeysLoading}>
-                        {sshKeysLoading ? t('saving') : t('save')}
-                      </button>
-                    </div>
-                  </div>
-                {/if}
-                <div class="ssh-key-list">
-                  {#each sshKeys as key}
-                    <div class="ssh-key-row">
-                      <span class="ssh-key-name">{key.name}</span>
-                      <span class="ssh-key-path">{key.path}</span>
-                      <span class="host-badge disabled-badge">{key.managed ? t('managed') : t('discovered')}</span>
-                      {#if key.managed}
-                        <button class="mgr-act danger" title={t('delete')} onclick={() => deleteSshKey(key.name)}>
-                          <span class="mgr-icon-delete"></span>
-                        </button>
-                      {/if}
-                    </div>
-                  {:else}
-                    <div class="host-empty compact">{t('noSshKeys')}</div>
-                  {/each}
-                </div>
-              </div>
-
               {#if hostEditMode}
                 <div class="host-form">
                   <div class="host-form-title">{hostEditMode === 'add' ? t('addHost') : t('editHost')}</div>
@@ -1868,6 +1832,15 @@
                     <label class="host-field">
                       <span class="host-field-label">{t('name')} *</span>
                       <input class="field-input" type="text" bind:value={hostForm.name} placeholder="my-server" />
+                    </label>
+                    <label class="host-field">
+                      <span class="host-field-label">{t('accessGateway')}</span>
+                      <select class="field-input" value={hostForm.gateway_host_id} onchange={(e) => setHostGateway(e.target.value)}>
+                        <option value="">{t('directConnection')}</option>
+                        {#each managedHosts.filter(h => h.id !== hostEditMode) as h}
+                          <option value={String(h.id)}>{h.name} ({h.connection_type === 'docker' ? 'Docker' : 'SSH'})</option>
+                        {/each}
+                      </select>
                     </label>
                     {#if hostForm.connection_type === 'docker'}
                       <label class="host-field">
@@ -1955,6 +1928,9 @@
                           {#if h.connection_type === 'docker'}
                             <span class="host-badge docker-badge">docker</span>
                           {/if}
+                          {#if h.gateway_host_id}
+                            <span class="host-badge gateway-badge">{t('viaGateway', { name: managedHosts.find(g => g.id === h.gateway_host_id)?.name || h.gateway_host_id })}</span>
+                          {/if}
                           {#if !h.enabled}
                             <span class="host-badge disabled-badge">{t('disabled')}</span>
                           {/if}
@@ -2037,6 +2013,59 @@
                   </div>
                 {/each}
               {/if}
+            </div>
+          {:else if settingsSection === 'keys'}
+            <div class="host-mgr">
+              <div class="host-mgr-toolbar">
+                <span class="host-mgr-count">{t('sshKeys')}</span>
+                <span class="spacer"></span>
+                <button class="host-toolbar-btn" onclick={loadSshKeys} disabled={sshKeysLoading}>
+                  {sshKeysLoading ? t('loading') : t('refresh')}
+                </button>
+                <button class="host-toolbar-btn primary" onclick={() => showAddKeyForm = !showAddKeyForm}>
+                  {showAddKeyForm ? t('cancel') : t('addSshKey')}
+                </button>
+              </div>
+
+              <div class="ssh-key-section">
+                {#if showAddKeyForm}
+                  <div class="ssh-key-form">
+                    <label class="host-field">
+                      <span class="host-field-label">{t('keyName')}</span>
+                      <input class="field-input" bind:value={sshKeyForm.name} placeholder="id_ed25519_prod" />
+                    </label>
+                    <label class="host-field full-width">
+                      <span class="host-field-label">{t('privateKey')}</span>
+                      <textarea class="field-input key-textarea" bind:value={sshKeyForm.privateKey} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+                    </label>
+                    <label class="host-field full-width">
+                      <span class="host-field-label">{t('publicKeyOptional')}</span>
+                      <input class="field-input" bind:value={sshKeyForm.publicKey} placeholder="ssh-ed25519 ..." />
+                    </label>
+                    <div class="host-form-actions">
+                      <button class="action-btn" onclick={saveSshKey} disabled={!sshKeyForm.name.trim() || !sshKeyForm.privateKey.trim() || sshKeysLoading}>
+                        {sshKeysLoading ? t('saving') : t('save')}
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+                <div class="ssh-key-list">
+                  {#each sshKeys as key}
+                    <div class="ssh-key-row">
+                      <span class="ssh-key-name">{key.name}</span>
+                      <span class="ssh-key-path">{key.path}</span>
+                      <span class="host-badge disabled-badge">{key.managed ? t('managed') : t('discovered')}</span>
+                      {#if key.managed}
+                        <button class="mgr-act danger" title={t('delete')} onclick={() => deleteSshKey(key.name)}>
+                          <span class="mgr-icon-delete"></span>
+                        </button>
+                      {/if}
+                    </div>
+                  {:else}
+                    <div class="host-empty compact">{t('noSshKeys')}</div>
+                  {/each}
+                </div>
+              </div>
             </div>
           {:else if settingsSection === 'sessions'}
             <div class="host-mgr">
@@ -2646,8 +2675,18 @@
 </div>
 
 <style>
+  :global(html),
+  :global(body) {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
   .app {
-    display: flex; flex-direction: column; height: 100vh;
+    display: flex; flex-direction: column; height: 100vh; height: 100dvh;
+    overflow: hidden;
 
     /* Theme variables */
     --accent: #F97316;
@@ -3267,6 +3306,7 @@
   .host-badge.tmux-badge { background: var(--success-bg); color: var(--success); }
   .host-badge.no-tmux-badge { background: var(--warning-bg); color: var(--warning); }
   .host-badge.docker-badge { background: rgba(61,139,253,0.12); color: #61afef; }
+  .host-badge.gateway-badge { background: rgba(199,146,234,0.12); color: #c792ea; }
   .host-badge.testing-badge { background: var(--accent-bg-med); color: var(--accent); animation: pulse 1s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 

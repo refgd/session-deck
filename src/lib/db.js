@@ -85,13 +85,15 @@ function migrate(db) {
       is_local INTEGER NOT NULL DEFAULT 0,
       connection_type TEXT NOT NULL DEFAULT 'ssh',
       docker_container TEXT,
+      gateway_host_id INTEGER,
       enabled INTEGER NOT NULL DEFAULT 1,
       sort_order INTEGER NOT NULL DEFAULT 0,
       last_test_status TEXT,
       last_test_at TEXT,
       tmux_available INTEGER,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (gateway_host_id) REFERENCES managed_hosts(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS session_types (
@@ -136,6 +138,12 @@ function migrate(db) {
     db.prepare('SELECT docker_container FROM managed_hosts LIMIT 1').get();
   } catch {
     db.exec('ALTER TABLE managed_hosts ADD COLUMN docker_container TEXT');
+  }
+
+  try {
+    db.prepare('SELECT gateway_host_id FROM managed_hosts LIMIT 1').get();
+  } catch {
+    db.exec('ALTER TABLE managed_hosts ADD COLUMN gateway_host_id INTEGER REFERENCES managed_hosts(id) ON DELETE SET NULL');
   }
 
   // Seed default session types if empty

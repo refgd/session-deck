@@ -10,6 +10,8 @@ RUN apt-get update \
 # does not install frontend dependencies in this layer.
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
+# Build native backend modules skipped by --ignore-scripts.
+RUN npm_config_build_from_source=true npm rebuild node-pty better-sqlite3
 
 # Install frontend dependencies reproducibly from the lock file.
 COPY frontend/package.json frontend/package-lock.json ./frontend/

@@ -9,6 +9,7 @@
 
   const items = [
     ['servers', 'servers-icon', 'servers', 'manageHosts'],
+    ['keys', 'keys-icon', 'sshKeys', 'manageSshKeys'],
     ['sessions', 'sessions-icon', 'sessions', 'tmuxSessions'],
     ['appearance', 'appearance-icon', 'appearance', 'colorsTheme'],
     ['help', 'help-icon', 'help', 'shortcutsDocs'],
@@ -52,6 +53,7 @@
     grid-row: span 2;
   }
   .servers-icon::before,
+  .keys-icon::before,
   .sessions-icon::before,
   .appearance-icon::before,
   .help-icon::before {
@@ -59,6 +61,7 @@
     font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700;
   }
   .servers-icon::before { content: '#'; }
+  .keys-icon::before { content: '~'; }
   .sessions-icon::before { content: '$'; }
   .appearance-icon::before { content: '*'; }
   .help-icon::before { content: '?'; }

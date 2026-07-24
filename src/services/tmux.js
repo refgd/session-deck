@@ -2,7 +2,8 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { execDocker, execDockerShell } from './docker.js';
+import { execDockerOnHost, execDockerShellOnHost } from './docker.js';
+import { shellQuote, sshCommand } from './connection.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -196,7 +197,7 @@ async function detectContext(host, sessionName, timeout) {
     // Try to detect git repo name
     if (host.connectionType === 'docker') {
       try {
-        const gitOut = await execDockerShell(host.dockerContainer || host.hostname, `cd '${shellQuoteInner(panePath)}' && git rev-parse --show-toplevel 2>/dev/null`, timeout);
+        const gitOut = await execDockerShellOnHost(host, `cd '${shellQuoteInner(panePath)}' && git rev-parse --show-toplevel 2>/dev/null`, timeout);
         const repoRoot = gitOut.trim();
         if (repoRoot) {
           ctx.repoName = repoRoot.split('/').pop();
@@ -235,28 +236,15 @@ async function execLocal(args, timeout) {
 
 async function execTmux(host, args, timeout) {
   if (host.connectionType === 'docker') {
-    return execDocker(host.dockerContainer || host.hostname, ['tmux', ...args], timeout);
+    return execDockerOnHost(host, ['tmux', ...args], timeout);
   }
   if (host.isLocal) return execLocal(args, timeout);
   return execRemote(host, `tmux ${args.map(shellQuote).join(' ')}`, timeout);
 }
 
 async function execRemote(host, command, timeout) {
-  const connectTimeoutSec = Math.ceil(timeout / 1000);
-  const args = [
-    '-o', `ConnectTimeout=${connectTimeoutSec}`,
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=accept-new',
-  ];
-
-  if (host.identityFile) {
-    args.push('-i', host.identityFile.replace('~', process.env.HOME));
-  }
-
-  const userHost = host.user ? `${host.user}@${host.hostname}` : host.hostname;
-  args.push(userHost, command);
-
-  const { stdout } = await execFileAsync('ssh', args, { timeout: timeout + 2000 });
+  const cmd = sshCommand(host, command, { timeoutMs: timeout });
+  const { stdout } = await execFileAsync(cmd.command, cmd.args, { timeout: timeout + 2000 });
   return stdout;
 }
 
@@ -283,10 +271,6 @@ function isTmuxServerNotRunning(err) {
     msg.includes('no current client') ||
     msg.includes('error connecting to /tmp/tmux-') ||
     msg.includes('failed to connect to server');
-}
-
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 function shellQuoteInner(value) {
@@ -354,7 +338,7 @@ export async function createSession(host, name, startDir) {
 
   try {
     if (host.connectionType === 'docker') {
-      await execDocker(host.dockerContainer || host.hostname, ['tmux', ...args], 5000);
+      await execDockerOnHost(host, ['tmux', ...args], 5000);
     } else if (host.isLocal) {
       await execLocal(args, 5000);
     } else {
@@ -382,7 +366,7 @@ export async function renameSession(host, oldName, newName) {
 
   try {
     if (host.connectionType === 'docker') {
-      await execDocker(host.dockerContainer || host.hostname, ['tmux', 'rename-session', '-t', oldName, newName], 5000);
+      await execDockerOnHost(host, ['tmux', 'rename-session', '-t', oldName, newName], 5000);
     } else if (host.isLocal) {
       await execLocal(['rename-session', '-t', oldName, newName], 5000);
     } else {
@@ -406,7 +390,7 @@ export async function renameSession(host, oldName, newName) {
 export async function deleteSession(host, name) {
   try {
     if (host.connectionType === 'docker') {
-      await execDocker(host.dockerContainer || host.hostname, ['tmux', 'kill-session', '-t', name], 5000);
+      await execDockerOnHost(host, ['tmux', 'kill-session', '-t', name], 5000);
     } else if (host.isLocal) {
       await execLocal(['kill-session', '-t', name], 5000);
     } else {
@@ -433,8 +417,8 @@ export async function scrollSession(host, sessionName, lines) {
   const timeout = 2000;
 
   if (host.connectionType === 'docker') {
-    await execDocker(host.dockerContainer || host.hostname, ['tmux', 'copy-mode', '-e', '-t', sessionName], timeout);
-    await execDocker(host.dockerContainer || host.hostname, ['tmux', 'send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
+    await execDockerOnHost(host, ['tmux', 'copy-mode', '-e', '-t', sessionName], timeout);
+    await execDockerOnHost(host, ['tmux', 'send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
   } else if (host.isLocal) {
     await execLocal(['copy-mode', '-e', '-t', sessionName], timeout);
     await execLocal(['send-keys', '-t', sessionName, '-X', '-N', String(count), direction], timeout);
@@ -460,8 +444,8 @@ export async function captureSession(host, sessionName) {
     // List all window.pane indices in the session
     let paneList;
     if (host.connectionType === 'docker') {
-      paneList = await execDocker(
-        host.dockerContainer || host.hostname,
+      paneList = await execDockerOnHost(
+        host,
         ['tmux', 'list-panes', '-t', sessionName, '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
         timeout
       );
@@ -495,8 +479,8 @@ export async function captureSession(host, sessionName) {
       try {
         let output;
         if (host.connectionType === 'docker') {
-          output = await execDocker(
-            host.dockerContainer || host.hostname,
+          output = await execDockerOnHost(
+            host,
             ['tmux', 'capture-pane', '-t', paneTarget, '-p', '-S', '-'],
             timeout
           );

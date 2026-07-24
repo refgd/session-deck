@@ -3,6 +3,8 @@
 import { listAllSessions, listSessions, createSession, renameSession, deleteSession, captureSession } from '../services/tmux.js';
 import { isValidSessionName } from '../lib/validate.js';
 import { findHost, getSessionHosts } from '../services/hosts.js';
+import { execDockerOnHost } from '../services/docker.js';
+import { shellQuote, sshCommand } from '../services/connection.js';
 
 export default async function sessionsRoutes(fastify) {
   const db = fastify.db;
@@ -139,18 +141,12 @@ export default async function sessionsRoutes(fastify) {
 
       for (const line of lines) {
         if (host.connectionType === 'docker') {
-          await execFileAsync('docker', ['exec', host.dockerContainer || host.hostname, 'tmux', 'send-keys', '-t', sessionName, line, 'Enter'], { timeout: 5000 });
+          await execDockerOnHost(host, ['tmux', 'send-keys', '-t', sessionName, line, 'Enter'], 5000);
         } else if (host.isLocal) {
           await execFileAsync('tmux', ['send-keys', '-t', sessionName, line, 'Enter'], { timeout: 2000 });
         } else {
-          const sshArgs = [
-            '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=accept-new',
-          ];
-          if (host.identityFile) sshArgs.push('-i', host.identityFile.replace('~', process.env.HOME));
-          const userHost = host.user ? `${host.user}@${host.hostname}` : host.hostname;
-          sshArgs.push(userHost, `tmux send-keys -t '${sessionName}' '${line.replace(/'/g, "'\\''")}' Enter`);
-          await execFileAsync('ssh', sshArgs, { timeout: 5000 });
+          const cmd = sshCommand(host, `tmux send-keys -t ${shellQuote(sessionName)} ${shellQuote(line)} Enter`, { timeoutMs: 3000 });
+          await execFileAsync(cmd.command, cmd.args, { timeout: 5000 });
         }
         // Small delay between lines to avoid overwhelming the terminal
         await new Promise(r => setTimeout(r, 50));

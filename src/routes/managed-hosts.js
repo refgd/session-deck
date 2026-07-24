@@ -3,10 +3,28 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseSSHConfig } from '../services/ssh-config.js';
-import { execDocker, listRunningContainers } from '../services/docker.js';
+import { execDockerOnHost, listRunningContainers } from '../services/docker.js';
 import { deleteSshKey, listSshKeys, saveSshKey } from '../services/ssh-keys.js';
+import { mapManagedHost } from '../services/hosts.js';
+import { sshBaseArgs, sshTarget } from '../services/connection.js';
 
 const execFileAsync = promisify(execFile);
+
+function normalizeHost(host) {
+  if (!host) return host;
+  if (host.connectionType) return host;
+  const normalized = mapManagedHost(host);
+  if (host.gatewayHost) normalized.gatewayHost = host.gatewayHost;
+  if (host.gateway_host_id && !normalized.gatewayHost) normalized.gatewayHostId = host.gateway_host_id;
+  return normalized;
+}
+
+function attachGateway(db, host) {
+  if (!host?.gateway_host_id) return host;
+  const gateway = db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1 AND id = ?').get(host.gateway_host_id);
+  if (!gateway || gateway.id === host.id) return host;
+  return { ...host, gatewayHost: mapManagedHost(gateway) };
+}
 
 /**
  * Test SSH connectivity and tmux availability for a host.
@@ -28,21 +46,17 @@ async function testHost(host) {
     const connectionType = host.connection_type || (host.auth_method === 'docker' ? 'docker' : 'ssh');
 
     if (connectionType === 'docker') {
-      const container = host.docker_container || host.hostname;
-      const { stdout: running } = await execFileAsync('docker', ['inspect', '-f', '{{.State.Running}}', container], { timeout: 5000 });
-      if (running.trim() !== 'true') {
-        throw new Error('Container is not running');
-      }
+      await execDockerOnHost(normalizeHost(host), ['true'], 5000);
       result.status = 'ok';
 
       try {
-        const stdout = await execDocker(container, ['tmux', '-V'], 5000);
+        const stdout = await execDockerOnHost(normalizeHost(host), ['tmux', '-V'], 5000);
         result.tmuxAvailable = true;
         result.tmuxVersion = stdout.trim();
       } catch {
         result.tmuxAvailable = false;
         try {
-          const stdout = await execDocker(container, ['cat', '/etc/os-release'], 5000);
+          const stdout = await execDockerOnHost(normalizeHost(host), ['cat', '/etc/os-release'], 5000);
           const idMatch = stdout.match(/^ID=(.+)$/m);
           const nameMatch = stdout.match(/^PRETTY_NAME="?(.+?)"?$/m);
           result.osId = idMatch?.[1]?.replace(/"/g, '') || null;
@@ -149,7 +163,7 @@ async function installTmux(host) {
   }
 
   if (connectionType === 'docker') {
-    await execFileAsync('docker', ['exec', host.docker_container || host.hostname, 'sh', '-lc', installCommand], { timeout: 120000 });
+    await execDockerOnHost(normalizeHost(host), ['sh', '-lc', installCommand], 120000);
   } else if (host.is_local) {
     await execFileAsync('sh', ['-lc', installCommand], { timeout: 120000 });
   } else {
@@ -165,16 +179,7 @@ async function installTmux(host) {
  * Build SSH command arguments for a host.
  */
 function buildSSHArgs(host) {
-  const args = [
-    '-o', 'ConnectTimeout=5',
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=accept-new',
-  ];
-  if (host.identity_file) args.push('-i', host.identity_file.replace('~', process.env.HOME));
-  if (host.port && host.port !== 22) args.push('-p', String(host.port));
-  const target = host.user ? `${host.user}@${host.hostname}` : host.hostname;
-  args.push(target);
-  return args;
+  return [...sshBaseArgs(normalizeHost(host), { timeoutMs: 5000 }), sshTarget(host)];
 }
 
 /**
@@ -202,7 +207,12 @@ export default async function managedHostsRoutes(fastify) {
 
   fastify.get('/api/docker/containers', async (request, reply) => {
     try {
-      return { containers: await listRunningContainers() };
+      const gatewayId = request.query.gateway_host_id ? Number(request.query.gateway_host_id) : null;
+      const gateway = gatewayId
+        ? db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1 AND id = ?').get(gatewayId)
+        : null;
+      if (gatewayId && !gateway) return reply.code(404).send({ error: 'Gateway host not found' });
+      return { containers: await listRunningContainers(gateway ? mapManagedHost(gateway) : null) };
     } catch (err) {
       return reply.code(503).send({ error: err.message || 'Failed to list Docker containers' });
     }
@@ -251,12 +261,17 @@ export default async function managedHostsRoutes(fastify) {
 
   // Create host
   fastify.post('/api/managed-hosts', async (request, reply) => {
-    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container } = request.body;
+    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container, gateway_host_id } = request.body;
     const connectionType = connection_type === 'docker' ? 'docker' : 'ssh';
     const containerName = docker_container?.trim() || null;
     const resolvedHostname = connectionType === 'docker' ? containerName : hostname?.trim();
+    const gatewayHostId = gateway_host_id ? Number(gateway_host_id) : null;
     if (!name?.trim() || !resolvedHostname) {
       return reply.code(400).send({ error: 'Name and hostname are required' });
+    }
+    if (gatewayHostId) {
+      const gateway = db.prepare('SELECT id FROM managed_hosts WHERE id = ?').get(gatewayHostId);
+      if (!gateway) return reply.code(400).send({ error: 'Gateway host not found' });
     }
 
     // Check for duplicate name
@@ -269,8 +284,8 @@ export default async function managedHostsRoutes(fastify) {
     const nextSort = (maxSort?.m ?? -1) + 1;
 
     const result = db.prepare(`
-      INSERT INTO managed_hosts (name, hostname, user, port, identity_file, auth_method, group_name, is_local, connection_type, docker_container, enabled, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO managed_hosts (name, hostname, user, port, identity_file, auth_method, group_name, is_local, connection_type, docker_container, gateway_host_id, enabled, sort_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name.trim(),
       resolvedHostname,
@@ -282,6 +297,7 @@ export default async function managedHostsRoutes(fastify) {
       connectionType === 'docker' ? 0 : (is_local ? 1 : 0),
       connectionType,
       containerName,
+      gatewayHostId,
       enabled !== false ? 1 : 0,
       nextSort
     );
@@ -296,21 +312,29 @@ export default async function managedHostsRoutes(fastify) {
     const existing = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
     if (!existing) return reply.code(404).send({ error: 'Host not found' });
 
-    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container } = request.body;
+    const { name, hostname, user, port, identity_file, auth_method, group_name, is_local, enabled, connection_type, docker_container, gateway_host_id } = request.body;
     const connectionType = connection_type === 'docker' ? 'docker' : (connection_type || existing.connection_type || 'ssh');
     const containerName = docker_container?.trim() || existing.docker_container || null;
     const resolvedHostname = connectionType === 'docker' ? containerName : (hostname?.trim() ?? existing.hostname);
+    const gatewayHostId = gateway_host_id !== undefined && gateway_host_id !== null && gateway_host_id !== ''
+      ? Number(gateway_host_id)
+      : null;
 
     // Check for name collision with other hosts
     if (name && name.trim() !== existing.name) {
       const dup = db.prepare('SELECT id FROM managed_hosts WHERE name = ? AND id != ?').get(name.trim(), existing.id);
       if (dup) return reply.code(409).send({ error: `Host "${name.trim()}" already exists` });
     }
+    if (gatewayHostId) {
+      if (gatewayHostId === existing.id) return reply.code(400).send({ error: 'Host cannot use itself as gateway' });
+      const gateway = db.prepare('SELECT id FROM managed_hosts WHERE id = ?').get(gatewayHostId);
+      if (!gateway) return reply.code(400).send({ error: 'Gateway host not found' });
+    }
 
     db.prepare(`
       UPDATE managed_hosts SET
         name = ?, hostname = ?, user = ?, port = ?, identity_file = ?,
-        auth_method = ?, group_name = ?, is_local = ?, connection_type = ?, docker_container = ?, enabled = ?,
+        auth_method = ?, group_name = ?, is_local = ?, connection_type = ?, docker_container = ?, gateway_host_id = ?, enabled = ?,
         updated_at = datetime('now')
       WHERE id = ?
     `).run(
@@ -324,6 +348,7 @@ export default async function managedHostsRoutes(fastify) {
       connectionType === 'docker' ? 0 : (is_local !== undefined ? (is_local ? 1 : 0) : existing.is_local),
       connectionType,
       connectionType === 'docker' ? containerName : null,
+      gatewayHostId,
       enabled !== undefined ? (enabled ? 1 : 0) : existing.enabled,
       existing.id
     );
@@ -388,7 +413,7 @@ export default async function managedHostsRoutes(fastify) {
 
   // Test connectivity and tmux availability for a single host
   fastify.post('/api/managed-hosts/:id/test', async (request, reply) => {
-    const host = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
+    const host = attachGateway(db, db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id));
     if (!host) return reply.code(404).send({ error: 'Host not found' });
 
     const result = await testHost(host);
@@ -406,7 +431,7 @@ export default async function managedHostsRoutes(fastify) {
 
   // Install tmux on a reachable host after user confirmation in the UI
   fastify.post('/api/managed-hosts/:id/install-tmux', async (request, reply) => {
-    const host = db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id);
+    const host = attachGateway(db, db.prepare('SELECT * FROM managed_hosts WHERE id = ?').get(request.params.id));
     if (!host) return reply.code(404).send({ error: 'Host not found' });
 
     try {
@@ -425,7 +450,7 @@ export default async function managedHostsRoutes(fastify) {
 
   // Test all enabled hosts in parallel
   fastify.post('/api/managed-hosts/test-all', async () => {
-    const hosts = db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1').all();
+    const hosts = db.prepare('SELECT * FROM managed_hosts WHERE enabled = 1').all().map(host => attachGateway(db, host));
 
     const results = await Promise.allSettled(
       hosts.map(async (host) => {

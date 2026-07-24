@@ -101,7 +101,6 @@
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(data);
     }
-    term?.focus();
   }
 
   export function focusTerminal() {
@@ -235,14 +234,13 @@
       initError = null;
       try { fitAddon.fit(); } catch { /* refit happens via ResizeObserver */ }
 
-      // Focus on ANY pointer interaction (mouse, touch, or pen) so a single
-      // click/tap lets you type immediately.
+      // Desktop gets click-to-type. On touch devices, only the keybar keyboard
+      // button focuses xterm's hidden textarea, preventing surprise keyboard popups.
       containerEl.addEventListener('pointerdown', () => {
-        term.focus();
+        if (!isTouchDevice) term.focus();
       });
 
-      // Mobile: auto-focus so the on-screen keyboard appears
-      if (isMobile && focused) {
+      if (!isTouchDevice && focused) {
         setTimeout(() => term.focus(), 150);
       }
 
@@ -270,14 +268,24 @@
         return measured || (term.options.fontSize * term.options.lineHeight) || 16;
       };
 
+      let pendingTouchPixels = 0;
+      let touchScrollFrame = null;
+
       const scrollByPixels = (deltaY) => {
         if (!term || !deltaY) return;
         const lines = Math.trunc(deltaY / lineHeight()) || (deltaY > 0 ? 1 : -1);
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'scroll', lines }));
-          return;
-        }
         term.scrollLines(lines);
+      };
+
+      const scheduleTouchScroll = (deltaY) => {
+        pendingTouchPixels += deltaY;
+        if (touchScrollFrame) return;
+        touchScrollFrame = requestAnimationFrame(() => {
+          touchScrollFrame = null;
+          const pixels = pendingTouchPixels;
+          pendingTouchPixels = 0;
+          scrollByPixels(pixels);
+        });
       };
 
       const onWheel = (event) => {
@@ -307,7 +315,7 @@
       const onTouchMove = (event) => {
         if (event.touches.length !== 1 || lastTouchY === null) return;
         const nextY = event.touches[0].clientY;
-        scrollByPixels(lastTouchY - nextY);
+        scheduleTouchScroll(lastTouchY - nextY);
         lastTouchY = nextY;
         event.preventDefault();
         event.stopPropagation();
@@ -323,6 +331,7 @@
       containerEl.addEventListener('touchcancel', onTouchEnd, { capture: true });
 
       scrollbackCleanup = () => {
+        if (touchScrollFrame) cancelAnimationFrame(touchScrollFrame);
         containerEl.removeEventListener('wheel', onWheel, { capture: true });
         containerEl.removeEventListener('touchstart', onTouchStart, { capture: true });
         containerEl.removeEventListener('touchmove', onTouchMove, { capture: true });

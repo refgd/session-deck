@@ -33,6 +33,8 @@
     { label: '↑', seq: ESC + '[A' },
     { label: '↓', seq: ESC + '[B' },
     { label: '→', seq: ESC + '[C' },
+    { label: 'PgUp', seq: ESC + '[5~', titleKey: 'pageUp', page: true },
+    { label: 'PgDn', seq: ESC + '[6~', titleKey: 'pageDown', page: true },
     { label: '↵', seq: '\r', accent: true, titleKey: 'enter' },
   ];
 
@@ -60,6 +62,7 @@
         class="key"
         class:wide={k.wide}
         class:accent={k.accent}
+        class:page={k.page}
         title={k.titleKey ? t(k.titleKey) : k.label}
         onpointerdown={(e) => { e.preventDefault(); tapKey(k.seq); }}
       >{k.label}</button>
@@ -140,6 +143,7 @@
     font-weight: 700;
   }
   .key.kbd { flex: 0.9; font-size: 18px; }
+  .key.page { font-size: 10px; }
   .key.num { font-size: 16px; }
   .numbers .key { height: 34px; }
 </style>

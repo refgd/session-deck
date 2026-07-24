@@ -3,6 +3,7 @@
 import pty from 'node-pty';
 import { parseSSHConfig } from './ssh-config.js';
 import { findHost } from './hosts.js';
+import { dockerExecCommand, terminalAttachCommand } from './connection.js';
 
 const activePTYs = new Map();
 
@@ -24,39 +25,27 @@ export function spawnTerminal(sessionName, hostName, options = {}) {
   const host = resolveHost(hostName, options.db);
 
   if (host?.connectionType === 'docker') {
-    shell = 'docker';
-    args = [
-      'exec',
-      '-it',
-      '-e', 'TERM=xterm-256color',
-      '-e', 'LANG=C.UTF-8',
-      '-e', 'LC_ALL=C.UTF-8',
-      host.dockerContainer || host.hostname,
+    const cmd = dockerExecCommand(host, [
       'tmux',
       '-u',
       'attach-session',
       '-t',
       sessionName,
-    ];
+    ], {
+      interactive: true,
+      execOptions: ['-e', 'TERM=xterm-256color', '-e', 'LANG=C.UTF-8', '-e', 'LC_ALL=C.UTF-8'],
+    });
+    shell = cmd.command;
+    args = cmd.args;
   } else if (!host || host.isLocal) {
     // Local tmux attach — -u forces UTF-8 mode regardless of host locale
     shell = 'tmux';
     args = ['-u', 'attach-session', '-t', sessionName];
   } else {
     // Remote via SSH
-    shell = 'ssh';
-    args = [
-      '-o', 'ConnectTimeout=5',
-      '-o', 'StrictHostKeyChecking=accept-new',
-      '-o', 'SendEnv=LANG LC_ALL',
-      '-tt', // Force PTY allocation (double-t needed inside Docker containers)
-    ];
-    if (host.identityFile) {
-      args.push('-i', host.identityFile.replace('~', process.env.HOME));
-    }
-    const userHost = host.user ? `${host.user}@${host.hostname}` : host.hostname;
-    // -u forces tmux UTF-8 on the remote side too
-    args.push(userHost, `LANG=C.UTF-8 LC_ALL=C.UTF-8 tmux -u attach-session -t ${sessionName}`);
+    const cmd = terminalAttachCommand(host, sessionName);
+    shell = cmd.command;
+    args = cmd.args;
   }
 
   const term = pty.spawn(shell, args, {
